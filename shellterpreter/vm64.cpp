@@ -1131,7 +1131,9 @@ uint32_t run64(Loaded& l) {
     e.envBase = l.envBase;
     e.envEnd = l.envBase + l.envLen;
 
-    e.r[kRSP] = e.stkEnd - 8;
+    // leave 0x100 bytes above the initial rsp: stand-in interception may peek
+    // at unused vararg slots, and reads must stay inside the region
+    e.r[kRSP] = e.stkEnd - 8 - 0x100;
     if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return FAULT_OOB;
     e.ip = l.imgBase;
 
@@ -1142,7 +1144,7 @@ uint32_t run64(Loaded& l) {
             uint64_t ret = 0;
             if (!memLd<uint64_t>(e, e.r[kRSP], ret)) return FAULT_OOB;
             e.r[kRSP] += 8; // [rsp+0x28] arg5 at call entry = [rsp+0x20] here
-            uint64_t args[4] = { e.r[1], e.r[2], e.r[8], e.r[9] };
+            uint64_t args[8] = { e.r[1], e.r[2], e.r[8], e.r[9], 0, 0, 0, 0 };
             for (int i = 4; i < api->nargs && i < 8; ++i) {
                 if (!memLd<uint64_t>(e, e.r[kRSP] + 0x20 + 8 * (i - 4), args[i]))
                     return FAULT_OOB;

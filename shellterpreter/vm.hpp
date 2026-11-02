@@ -36,6 +36,8 @@ struct Loaded;
 struct ApiEntry {
     uint64_t addr;
     int      nargs;
+    // false (default): x86 stdcall, callee pops ret+nargs
+    bool     callerCleans; // x86 cdecl (printf etc): caller pops ret only
     uint64_t (*fn)(Loaded&, const uint64_t* args);
 };
 

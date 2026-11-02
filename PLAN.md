@@ -17,7 +17,9 @@ shellterpreter uses it for architecture detection only.
 
 ## User decisions (goal crafting)
 
-- **ISA / ABI**: Windows, both x86 and x64, one interpreter core.
+- **ISA / ABI**: Windows, both x86 and x64. The 32-bit interpreter build runs
+  32-bit shellcode only; the 64-bit interpreter build runs x64 and x86
+  shellcode.
 - **Instruction coverage**: common growable subset; fail closed with a
   reserved diagnostic code on anything unimplemented; the test suite drives
   what gets added.
@@ -116,13 +118,31 @@ there.
   (stub ordinals are masked 0xffff, name pointers >= imgBase >= 0x10000);
   vm86 added `pusha`/`popa` (IMPORTS_32 opens with `pushal`).
 - Liberation: env layout documented in `export_resolver.cpp` header comment.
-- pytest: 15 passed in Release and Debug (incl. audit tests).
-- Remaining for this iteration: `04_crt_printf_rand` (enumerate its real PE
-  imports first), `09_resources` (FindResourceA/SizeofResource stand-ins).
+- pytest: 18 passed in Release and Debug (incl. audit tests).
+- `04_crt_printf_rand` complete (x64 + x86): real PE imports enumerated from
+  the built exe = one module `msvcrt.dll` with `printf`, `rand`, `srand`
+  (by name, no ordinals). A hand-generated import lib
+  (`tests/test_projects/04_crt_printf_rand/msvcrt.mini.def` +
+  `msvcrt_mini_x64.lib` / `msvcrt_mini_Win32.lib`) supplies them because the
+  UCRT headers model `printf` as an inline wrapper over
+  `__stdio_common_vfprintf`; no shipped lib exports `__imp_printf`.
+  Stand-ins: minimal `printf` (%d %i %u %x %X %c %s %%, buffered, unsupported
+  conversion -> -1, writes guest text to interpreter stdout), MSVCRT LCG
+  `rand`/`srand` (shared seed, caller's 5 draws match a Python model).
+  `ApiEntry.callerCleans` marks x86 cdecl stand-ins (caller pops args).
+- Arch dispatch: x64 interpreter runs x64 and x86 shellcode; the 32-bit
+  interpreter runs x86 only and fails closed with `0xE0000007` on x64
+  shellcode (`test_arch_dispatch`).
+- `09_resources` (FindResourceA/SizeofResource stand-ins) still open.
 
 ### Iteration 5 — CRT basics
 - Tests: `05_dll_entry`, `08_cpp_thread` (threads as interpreter-driven
   contexts), CRT startup pieces.
+- Threads are a hard requirement (`std::thread` in the test corpus too): the
+  interpreter must run the shellcode's thread entry points itself, as
+  emulated contexts on separate interpreter stacks. Stand-in/syscall
+  entry points must take their parameters from interpreter-owned globals
+  rather than shuffling them through guest registers.
 
 ### Iteration 6 — exceptions
 - x64 table-based first, then x86 VEH-model. Multiple exception types must be

@@ -33,7 +33,26 @@ Implement iterations 4-7 from `PLAN.md`: fake PEB/TEB/environment + import stand
     - ordinal threshold `kOrdinalMax = 0x10000`: stub ordinals are masked
       0xffff; name pointers are absolute >= imgBase >= 0x10000.
     - vm86 `pusha`/`popa` implemented (IMPORTS_32 opens with `pushal`).
-- Test suite: 15 passed in Release and Debug (`SHELLTERP_CONFIG=Debug`).
+- Iteration 4b (`04_crt_printf_rand`) implemented, x64 + x86, Release + Debug:
+  - real imports enumerated from the built exe: one module `msvcrt.dll`, by
+    name `srand`/`rand`/`printf` (no ordinals, no hidden CRT imports).
+  - the test project owns a hand-generated import lib
+    (`msvcrt.mini.def` -> `msvcrt_mini_x64.lib` / `msvcrt_mini_Win32.lib`)
+    because no shipped lib exports `__imp_printf` (UCRT models printf as an
+    inline wrapper over `__stdio_common_vfprintf`).
+  - stand-ins in `export_resolver.cpp`: buffered `printf`
+    (`%d %i %u %x %X %c %s %%`, unsupported -> -1, guest text to interpreter
+    stdout), MSVCRT LCG `rand`/`srand`. New `ApiEntry.callerCleans` marks x86
+    cdecl stand-ins so vm86 pops only the return address.
+  - both cores now start rsp/esp 0x100 bytes below `stkEnd` so vararg peeks
+    stay inside the stack region (was intermittent `0xE0000002`).
+  - vm86 gained `div`/`idiv` (8/16/32-bit, signed and unsigned; Debug `/Od`
+    emits `div` for `%`).
+  - vm64 interception's `uint64_t args[4]` written at indices 4..7 was an
+    out-of-bounds host write; now `args[8]`.
+  - arch dispatch: 32-bit build refuses x64 shellcode with `0xE0000007`;
+    64-bit build runs both (`test_arch_dispatch`).
+- Test suite: 18 passed in Release and Debug (`SHELLTERP_CONFIG=Debug`).
 - Debug builds use isolated `Debug_x64`/`Debug_Win32` OutDirs and `/INCREMENTAL:NO`.
 - `tests/pytest/conftest.py` supports `SHELLTERP_CONFIG=Debug`.
 
@@ -65,10 +84,12 @@ pytest tests\pytest -v
 ```
 
 ## Remaining Work (next iterations)
-- Iteration 4 remainder: `04_crt_printf_rand` (CRT pieces — enumerate its real
-  PE imports before coding handlers) and `09_resources`
-  (FindResourceA/SizeofResource stand-ins). Both then run in Release + Debug.
-- Iteration 5: CRT basics. Tests: `05_dll_entry`, `08_cpp_thread`.
+- Iteration 4 remainder: `09_resources` (FindResourceA/SizeofResource
+  stand-ins). Release + Debug.
+- Iteration 5: CRT basics + threads. Tests: `05_dll_entry`, `08_cpp_thread`
+  (`std::thread` must work: interpreter runs thread entry points as its own
+  emulated contexts; stand-in/syscall entry points take parameters from
+  interpreter-owned globals instead of shuffling guest registers).
 - Iteration 6: exceptions (x64 table-based first, then x86 VEH). Tests: `07_cpp_exceptions`, `11_cpp_exceptions`, `12_seh_exceptions`, `15_nested_exceptions`.
 - Iteration 7: hardening + docs.
 
@@ -80,10 +101,8 @@ pytest tests\pytest -v
 - Keep code comments minimal (why only).
 
 ## Immediate Next Step
-Finish iteration 4: build test PE `04_crt_printf_rand` first, dump its import
-table (dumpbin or python pefile) and add the needed CRT stand-ins to
-`export_resolver.cpp` (printf/rand/srand/exit family — each needs real
-emulation, e.g. printf writes to stdout, rand is deterministic); extend
-`test_iteration4.py`. Then `09_resources` (FindResourceA + SizeofResource
-stand-ins validate RT_RCDATA/test-resource bytes exit). Run Release + Debug
-pytest (15 -> more), then commit each.
+Finish iteration 4 with `09_resources`: add a `.rc` resource to a test PE,
+dump its real imports, add FindResourceA + SizeofResource stand-ins to
+`export_resolver.cpp` (exit code validates RT_RCDATA/test-resource byte count),
+extend `test_iteration4.py`, run Release + Debug pytest, commit. Then start
+iteration 5 (CRT basics + threads, `std::thread` included).

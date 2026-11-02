@@ -1,6 +1,7 @@
 #include "export_resolver.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cstdio>
 #include <cstring>
 
 namespace stub {
@@ -13,6 +14,8 @@ namespace stub {
 //   0x800  fake kernel32 image            0x1000 fake ntdll image
 //   0xA00  LoadLibraryA stand-in          0xA10  GetProcAddress stand-in
 //   0x1010 RtlAdd* stand-in               0x1C00 MessageBoxA stand-in
+//   0x1D00 printf stand-in                0x1D10 srand stand-in
+//   0x1D20 rand stand-in                  0x1E00 fake msvcrt module handle (no image)
 //   0x1800 fake user32 module handle (no image; GetProcAddress never walks it)
 namespace {
 constexpr uint32_t K32_RVA    = 0x800;
@@ -22,6 +25,10 @@ constexpr uint32_t ST_LL_A    = 0xA00;
 constexpr uint32_t ST_GP_A    = 0xA10;
 constexpr uint32_t ST_MB_A    = 0x1C00;
 constexpr uint32_t ST_NT_A    = 0x1010;
+constexpr uint32_t ST_PRINTF_A = 0x1D00;
+constexpr uint32_t ST_SRAND_A  = 0x1D10;
+constexpr uint32_t ST_RAND_A   = 0x1D20;
+constexpr uint32_t MSVCRT_RVA  = 0x1E00;
 }
 
 void* allocLow(size_t sz) {
@@ -81,6 +88,7 @@ static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
         return l.envBase + K32_RVA;
     }
     if (nameEq(name, "user32.dll")) return l.envBase + USER32_RVA;
+    if (nameEq(name, "msvcrt.dll")) return l.envBase + MSVCRT_RVA;
     return 0;
 }
 
@@ -91,12 +99,81 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "LoadLibraryA"))  return l.envBase + ST_LL_A;
     if (nameEq(name, "GetProcAddress")) return l.envBase + ST_GP_A;
     if (nameEq(name, "MessageBoxA"))   return l.envBase + ST_MB_A;
+    if (nameEq(name, "printf"))        return l.envBase + ST_PRINTF_A;
+    if (nameEq(name, "srand"))         return l.envBase + ST_SRAND_A;
+    if (nameEq(name, "rand"))          return l.envBase + ST_RAND_A;
     return 0;
 }
 
 static uint64_t apiMessageBoxA(Loaded&, const uint64_t*) { return 1; } // IDOK
 
 static uint64_t apiRtlAdd(Loaded&, const uint64_t*) { return 1; } // handler registered
+
+// rand/srand: classic MSVCRT LCG, shared static seed
+namespace {
+uint64_t gRandSeed = 0;
+}
+
+static uint64_t apiSrand(Loaded&, const uint64_t* args) {
+    gRandSeed = args[0] & 0xFFFFFFFFull;
+    return 0;
+}
+
+static uint64_t apiRand(Loaded&, const uint64_t*) {
+    gRandSeed = gRandSeed * 214013ull + 2531011ull;
+    return (gRandSeed >> 16) & 0x7FFF;
+}
+
+// minimal printf: %d %i %u %x %X %c %s %%. Buffered so an unsupported
+// conversion aborts the call with -1 and prints nothing (fail closed).
+static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
+    char fmt[96];
+    if (!guestStr(l, args[0], fmt)) return static_cast<uint64_t>(-1);
+    char out[256];
+    size_t n = 0;
+    int argIdx = 1;
+    for (const char* p = fmt; *p; ++p) {
+        if (*p != '%') {
+            if (n < sizeof(out)) out[n++] = *p;
+            continue;
+        }
+        const char spec = *++p;
+        if (spec == '%') {
+            if (n < sizeof(out)) out[n++] = '%';
+            continue;
+        }
+        // arguments at our call sites are 32-bit values; all guest pointers
+        // fit below 4 GB (allocLow keeps every region under 0x80000000)
+        const uint64_t v = args[argIdx++] & 0xFFFFFFFFull;
+        if (spec == 's') {
+            char s[64];
+            if (!guestStr(l, v, s)) return static_cast<uint64_t>(-1);
+            const size_t k = strlen(s);
+            if (n + k >= sizeof(out)) return static_cast<uint64_t>(-1);
+            memcpy(out + n, s, k);
+            n += k;
+            continue;
+        }
+        const size_t room = sizeof(out) - n - 1;
+        if (room == 0) return static_cast<uint64_t>(-1);
+        int k = -1;
+        switch (spec) {
+        case 'd': case 'i': k = snprintf(out + n, room, "%d", static_cast<int32_t>(static_cast<uint32_t>(v))); break;
+        case 'u': k = snprintf(out + n, room, "%u", static_cast<uint32_t>(v)); break;
+        case 'x': k = snprintf(out + n, room, "%x", static_cast<uint32_t>(v)); break;
+        case 'X': k = snprintf(out + n, room, "%X", static_cast<uint32_t>(v)); break;
+        case 'c': k = snprintf(out + n, room, "%c", static_cast<char>(v)); break;
+        default:
+            return static_cast<uint64_t>(-1); // unsupported conversion
+        }
+        if (k < 0) return static_cast<uint64_t>(-1);
+        if (static_cast<size_t>(k) > room) k = static_cast<int>(room);
+        n += static_cast<size_t>(k);
+    }
+    out[n] = '\0';
+    fwrite(out, 1, n, stdout);
+    return n;
+}
 
 uint32_t buildFakeEnv(Loaded& l) {
     constexpr size_t kEnv = 0x2000;
@@ -168,10 +245,13 @@ uint32_t buildFakeEnv(Loaded& l) {
     }
 
     const ApiEntry apis[] = {
-        { B + ST_NT_A, 2, apiRtlAdd },
-        { B + ST_LL_A, 1, apiLoadLibraryA },
-        { B + ST_GP_A, 2, apiGetProcAddress },
-        { B + ST_MB_A, 4, apiMessageBoxA },
+        { B + ST_NT_A, 2, false, apiRtlAdd },
+        { B + ST_LL_A, 1, false, apiLoadLibraryA },
+        { B + ST_GP_A, 2, false, apiGetProcAddress },
+        { B + ST_MB_A, 4, false, apiMessageBoxA },
+        { B + ST_PRINTF_A, 8, true, apiPrintf }, // cdecl: caller cleans
+        { B + ST_SRAND_A, 1, true, apiSrand },
+        { B + ST_RAND_A, 0, true, apiRand },
     };
     l.apiCount = static_cast<uint32_t>(sizeof(apis) / sizeof(apis[0]));
     memcpy(l.apis, apis, sizeof(apis));

@@ -142,6 +142,10 @@ int main(int argc, char** argv) {
         if (arch == 32 && l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
         if (arch == 64 && !l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
     }
+#ifndef _WIN64
+    // 32-bit host build runs x86 shellcode only
+    if (l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
+#endif
 
     std::vector<stub::ExecRange> baseline = stub::snapshotExecRanges();
 

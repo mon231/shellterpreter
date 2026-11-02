@@ -879,7 +879,24 @@ uint32_t step(Ctx& c) {
             c.e.cf = c.e.of = (p != static_cast<int64_t>(static_cast<int8_t>(res)));
             return FAULT_NONE;
         }
-        case 6: case 7: return FAULT_UNSUPPORTED;
+        case 6: case 7: { // div / idiv: dividend AX, quotient AL, remainder AH
+            const uint16_t n = static_cast<uint16_t>(c.e.r[0]);
+            const uint8_t d8 = static_cast<uint8_t>(a);
+            if (!d8) return FAULT_UNSUPPORTED; // real CPU raises #DE
+            uint8_t q, r;
+            if (kind == 6) {
+                if (n / d8 > 0xFF) return FAULT_UNSUPPORTED;
+                q = static_cast<uint8_t>(n / d8);
+                r = static_cast<uint8_t>(n % d8);
+            } else {
+                const int32_t qq = static_cast<int16_t>(n) / static_cast<int8_t>(d8);
+                if (qq > 127 || qq < -128) return FAULT_UNSUPPORTED;
+                q = static_cast<uint8_t>(qq);
+                r = static_cast<uint8_t>(static_cast<int16_t>(n) % static_cast<int8_t>(d8));
+            }
+            c.e.r[0] = (c.e.r[0] & ~static_cast<uint64_t>(0xFFFF)) | (static_cast<uint64_t>(r) << 8) | q;
+            return FAULT_NONE;
+        }
         default: return FAULT_UNSUPPORTED;
         }
     }
@@ -917,7 +934,51 @@ uint32_t step(Ctx& c) {
             c.e.cf = c.e.of = (static_cast<uint64_t>(p) != sext(sz, res));
             return FAULT_NONE;
         }
-        case 6: case 7: return FAULT_UNSUPPORTED;
+        case 6: case 7: { // div / idiv: dividend DX:AX (or EDX:EAX)
+            if (sz == 8) return FAULT_UNSUPPORTED;
+            const bool unsignedDiv = (kind == 6);
+            if (sz == 2) {
+                const uint16_t div = static_cast<uint16_t>(a);
+                if (!div) return FAULT_UNSUPPORTED;
+                const uint32_t n = (static_cast<uint32_t>(c.e.r[2] & 0xFFFF) << 16) |
+                                   static_cast<uint32_t>(c.e.r[0] & 0xFFFF);
+                uint32_t q, r;
+                if (unsignedDiv) {
+                    if (n / div > 0xFFFF) return FAULT_UNSUPPORTED;
+                    q = n / div;
+                    r = n % div;
+                } else {
+                    const int32_t sn = static_cast<int32_t>(n);
+                    const int16_t sd = static_cast<int16_t>(div);
+                    if (sd == -1 && sn == (-2147483647 - 1)) return FAULT_UNSUPPORTED;
+                    const int32_t qq = sn / sd;
+                    if (qq > 32767 || qq < -32768) return FAULT_UNSUPPORTED;
+                    q = static_cast<uint32_t>(qq);
+                    r = static_cast<uint32_t>(sn % sd);
+                }
+                c.e.r[0] = (c.e.r[0] & ~static_cast<uint64_t>(0xFFFF)) | (q & 0xFFFF);
+                c.e.r[2] = (c.e.r[2] & ~static_cast<uint64_t>(0xFFFF)) | (r & 0xFFFF);
+                return FAULT_NONE;
+            }
+            const uint32_t div = static_cast<uint32_t>(a);
+            if (!div) return FAULT_UNSUPPORTED;
+            const uint64_t n = (static_cast<uint64_t>(c.e.r[2] & 0xFFFFFFFF) << 32) |
+                               (c.e.r[0] & 0xFFFFFFFF);
+            if (unsignedDiv) {
+                if ((n >> 32) >= div) return FAULT_UNSUPPORTED;
+                c.e.r[0] = static_cast<uint32_t>(n / div);
+                c.e.r[2] = static_cast<uint32_t>(n % div);
+            } else {
+                const int64_t sn = static_cast<int64_t>(n);
+                const int32_t sd = static_cast<int32_t>(div);
+                if (sd == -1 && sn == (-9223372036854775807 - 1)) return FAULT_UNSUPPORTED;
+                const int64_t qq = sn / sd;
+                if (qq > 2147483647ll || qq < -2147483648ll) return FAULT_UNSUPPORTED;
+                c.e.r[0] = static_cast<uint32_t>(qq);
+                c.e.r[2] = static_cast<uint32_t>(sn % sd);
+            }
+            return FAULT_NONE;
+        }
         default: return FAULT_UNSUPPORTED;
         }
     }
@@ -1080,7 +1141,9 @@ uint32_t run86(Loaded& l) {
     e.envBase = l.envBase;
     e.envEnd = l.envBase + l.envLen;
 
-    e.r[kRSP] = e.stkEnd - 4;
+    // leave 0x100 bytes above the initial esp: stand-in interception may peek
+    // at unused vararg slots, and reads must stay inside the region
+    e.r[kRSP] = e.stkEnd - 4 - 0x100;
     if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
     e.ip = l.imgBase;
 
@@ -1097,7 +1160,7 @@ uint32_t run86(Loaded& l) {
             }
             uint32_t ret = 0;
             if (!memLd<uint32_t>(e, e.r[4], ret)) return FAULT_OOB;
-            e.r[4] += 4 * (1 + api->nargs);
+            e.r[4] += api->callerCleans ? 4 : 4 * (1 + api->nargs);
             e.r[0] = static_cast<uint32_t>(api->fn(l, args));
             e.ip = ret;
             continue;
