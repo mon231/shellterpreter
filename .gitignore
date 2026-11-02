@@ -1,0 +1,20 @@
+# Build outputs
+Win_x86/
+Win_x64/
+x64/
+Win32/
+bin/
+obj/
+*.obj
+*.pdb
+*.exe
+*.dll
+*.shellcode
+*.bin
+!tests/*.bin
+*.aps
+*.user
+.vs/
+__pycache__/
+.pytest_cache/
+.sdd/
