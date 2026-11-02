@@ -31,12 +31,20 @@ See `PLAN.md` for the roadmap and the user decisions behind these choices.
 
 ## Build
 
-From a *Developer Command Prompt* (Visual Studio 2022 or 18):
+pytest builds the solution itself. To build by hand from a *Developer
+Command Prompt* (Visual Studio 2022 or 18):
 
 ```bat
-python tests\build_tests.py Release x64
-python tests\build_tests.py Release Win32
+msbuild shellterpreter.sln /p:Configuration=Release /p:Platform=x64
+msbuild shellterpreter.sln /p:Configuration=Release /p:Platform=x86
 ```
+
+`Win_x64\shellterpreter.exe` is a dual-arch interpreter: it contains both the
+x64 and x86 cores and selects them via an embedded PE header or the
+`--x86`/`--x64` flag. `Win_x86\shellterpreter.exe` runs x86 shellcode only.
+GitHub Actions builds both and publishes them as artifacts
+(`shellterpreter-x64`, `shellterpreter-x86`); see
+`.github/workflows/ci.yml`.
 
 ## Test
 
@@ -53,5 +61,5 @@ pytest tests\pytest -v
 | `tests/test_projects/` | companion C++ test PEs (one per feature)          |
 | `tests/pytest/`        | pytest harness                                    |
 | `scripts/audit_pe.py`  | PE-structure checks used by the tests             |
-| `tests/build_tests.py` | msbuild driver (x64 + Win32)                      |
+| `.github/workflows/`   | CI: builds both configs, runs pytest, uploads exe |
 | `PLAN.md`              | roadmap, iteration log, user decisions            |

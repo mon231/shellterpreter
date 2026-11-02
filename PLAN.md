@@ -81,8 +81,12 @@ there.
   entry, x64), pytest (shellcode runs, audit, fail-closed unknown opcode),
   `scripts/audit_pe.py`, `tests/build_tests.py`.
 
-### Iteration 2 — x86 importless shellcode
+### Iteration 2 - x86 importless shellcode
 - 32-bit core, same contract. Tests: 01_simple_calc Win32.
+- Status: core runs but peor's x86 stub does fs:[0x30] PEB walk and
+  resolves AddVectoredExceptionHandler from a module export table, so the
+  calc test is xfail until the Iteration 4 stand-ins land. fs-prefix and
+  moffs (A0-A3) handling already added.
 
 ### Iteration 3 — base relocations
 - Tests: `02_relocs_functions` (static globals + .reloc),

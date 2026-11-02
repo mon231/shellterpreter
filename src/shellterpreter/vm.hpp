@@ -35,6 +35,7 @@ struct Loaded {
     uint8_t* stk;
     size_t   stkLen;
     uint64_t stkBase;
+    uint64_t fsBase;
     PeInfo   pe;
     bool     is64;
     bool     hasImage;

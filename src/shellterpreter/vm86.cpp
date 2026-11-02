@@ -20,6 +20,7 @@ struct Emu {
     bool cf = false, of = false, sf = false, zf = false, pf = false, af = false, df = false;
     Loaded* l = nullptr;
     uint64_t imgEnd = 0, stkEnd = 0;
+    uint64_t fsBase = 0;
     uint64_t budget = kInstrBudget;
 };
 
@@ -212,6 +213,7 @@ struct Ctx {
     uint64_t instStart;
     int rexW = 0, rexR = 0, rexX = 0, rexB = 0;
     bool op66 = false, rexUsed = false;
+    int segFs = 0;
     uint32_t fault = FAULT_NONE;
     MR mr;
     Oprm o{};  // r/m operand after decodeRm
@@ -251,6 +253,7 @@ struct Ctx {
         } else {
             ea = e.r[mr.rm | (rexB << 3)] + mr.disp;
         }
+        if (segFs) ea += e.fsBase;
         return ea;
     }
 
@@ -380,7 +383,8 @@ uint32_t stepOne(Ctx& c) {
         switch (p) {
         case 0x66: c.op66 = true; ++f.pos; continue;
         case 0x67: ++f.pos; continue;
-        case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x64: case 0x65: case 0xF3:
+        case 0x64: c.segFs = 1; ++f.pos; continue;
+        case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x65: case 0xF3:
             ++f.pos;
             continue;
         default:
@@ -1017,6 +1021,7 @@ uint32_t run86(Loaded& l) {
     e.l = &l;
     e.imgEnd = l.imgBase + l.imgLen;
     e.stkEnd = l.stkBase + l.stkLen;
+    e.fsBase = l.fsBase;
 
     e.r[kRSP] = e.stkEnd - 4;
     if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
