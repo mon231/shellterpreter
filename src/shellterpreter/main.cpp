@@ -36,7 +36,7 @@ uint32_t loadShellcode(const std::string& path, Loaded& out) {
     if (h == INVALID_HANDLE_VALUE) return FAULT_BAD_FILE;
     DWORD hi = 0;
     const DWORD lo = GetFileSize(h, &hi);
-    if (lo == INVALID_FILE_VALUE && hi != 0) { CloseHandle(h); return FAULT_BAD_FILE; }
+    if (lo == INVALID_FILE_SIZE && hi != 0) { CloseHandle(h); return FAULT_BAD_FILE; }
     std::vector<uint8_t> data;
     data.resize(static_cast<size_t>(lo) | (static_cast<size_t>(hi) << 32));
     DWORD got = 0;
