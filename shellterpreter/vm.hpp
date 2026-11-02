@@ -28,6 +28,17 @@ struct PeInfo {
     uint32_t sizeOfImage;
 };
 
+// Native stand-in registered by the loader. nargs counts the call-site
+// arguments (x64 keeps the first 4); the run loop intercepts ip == addr,
+// gathers args via the calling convention and returns fn() in RAX/EAX.
+// x86 uses stdcall (callee pops ret+nargs); x64 caller cleans.
+struct Loaded;
+struct ApiEntry {
+    uint64_t addr;
+    int      nargs;
+    uint64_t (*fn)(Loaded&, const uint64_t* args);
+};
+
 struct Loaded {
     uint8_t* img;
     size_t   imgLen;
@@ -40,18 +51,25 @@ struct Loaded {
     uint8_t* env;
     size_t   envLen;
     uint64_t envBase;
-    uint64_t ntEntry;
+    ApiEntry apis[8];
+    uint32_t apiCount;
     PeInfo   pe;
     bool     is64;
     bool     hasImage;
 };
+
+inline const ApiEntry* lookupApi(const Loaded& l, uint64_t ip) {
+    for (uint32_t i = 0; i < l.apiCount; ++i)
+        if (l.apis[i].addr == ip) return &l.apis[i];
+    return nullptr;
+}
 
 void freeLoaded(Loaded& l);
 
 // Returns FAULT_BAD_FILE when the file cannot be read or is empty. Detection
 // of an embedded PE header is optional; when none is found the buffer starts
 // at offset 0 and the caller picks the architecture explicitly.
-uint32_t loadShellcode(const std::string& path, Loaded& out);
+uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86);
 
 uint32_t run64(Loaded& l);
 uint32_t run86(Loaded& l);

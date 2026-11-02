@@ -8,10 +8,32 @@ Implement iterations 4-7 from `PLAN.md`: fake PEB/TEB/environment + import stand
 ## Current State (committed in this handoff)
 - Restructure complete: project code at root `shellterpreter/`; PE audit at `tests/audit_pe.py`.
 - Iteration 1 (x64 core), iteration 2 (x86 core), iteration 3 (base relocations) implemented.
-- Iteration 3 root causes fixed:
-  - `shellterpreter/vm64.cpp`: `rexUsed` flag now set in REX prefix case.
-  - `shellterpreter/vm86.cpp`: `decodeMR` treats `rm=5/mod=0` as absolute disp32 (`absDisp`), not RIP-relative.
-- Test suite: 13 passed in Release and Debug (`SHELLTERP_CONFIG=Debug`).
+- Iteration 4 partially implemented, `03_winapi_messagebox` green (x64 + x86, exit 102):
+  - `shellterpreter/export_resolver.{hpp,cpp}`: `buildFakeEnv` (fake TEB/PEB/Ldr
+    chain + fake kernel32/ntdll images with export dirs + user32 module token)
+    and compiled-in stand-ins (LoadLibraryA / GetProcAddress / MessageBoxA /
+    RtlAdd*). Env layout documented in the file header comment.
+  - `shellterpreter/vm.hpp`: `ApiEntry {addr, nargs, fn}`, `Loaded.apis[8]`,
+    `lookupApi(l, ip)`; replaces iteration-2's per-call `ntEntry` hook.
+  - `shellterpreter/main.cpp`: loader now calls `stub::buildFakeEnv(out)`;
+    `allocLow` moved to export_resolver.cpp.
+  - `shellterpreter/vm64.cpp` / `vm86.cpp`: run loops intercept stand-in calls
+    (x64: MS x64 ABI RCX/RDX/R8/R9 + shadow space arg5+; x86: stdcall, callee
+    pops ret + args, EAX result).
+  - New files: `tests/test_projects/03_winapi_messagebox/{main.c,vcxproj}`
+    (imported user32.dll, LoadLibraryA/GetProcAddress, MessageBoxA x2,
+    negative checks), `tests/pytest/test_iteration4.py`.
+  - Root causes fixed this round:
+    - export-dir RVA was written at imgBase+0x78/0x88 instead of
+      pehdr(e_lfanew=0x40)+0x78/0x88 (both fake images).
+    - vm64 stand-in args read RAX as arg0; arg0 is RCX.
+    - `doSubF` (both cores) called `flagsLogic` after computing borrow — CF
+      cleared, `cmp`+`ja` broken (MZ scan in peor IMPORTS stubs). Now
+      `flagsNZP` (same as adc/sbb).
+    - ordinal threshold `kOrdinalMax = 0x10000`: stub ordinals are masked
+      0xffff; name pointers are absolute >= imgBase >= 0x10000.
+    - vm86 `pusha`/`popa` implemented (IMPORTS_32 opens with `pushal`).
+- Test suite: 15 passed in Release and Debug (`SHELLTERP_CONFIG=Debug`).
 - Debug builds use isolated `Debug_x64`/`Debug_Win32` OutDirs and `/INCREMENTAL:NO`.
 - `tests/pytest/conftest.py` supports `SHELLTERP_CONFIG=Debug`.
 
@@ -24,10 +46,12 @@ Implement iterations 4-7 from `PLAN.md`: fake PEB/TEB/environment + import stand
 
 ## Key Files
 - `shellterpreter/vm64.cpp`, `shellterpreter/vm86.cpp`: instruction cores.
-- `shellterpreter/main.cpp`: loader, PEB/TEB/env stand-ins, allocLow.
+- `shellterpreter/export_resolver.cpp/.hpp`: fake env builder + API stand-ins.
+- `shellterpreter/vm.hpp`: ApiEntry/Loaded/lookupApi, loadShellcode decl.
+- `shellterpreter/main.cpp`: loader (calls buildFakeEnv; allocLow lives in export_resolver).
 - `shellterpreter/shellterpreter.vcxproj`: build config.
-- `tests/test_projects/02_relocs/`: relocation test PE.
-- `tests/pytest/test_iteration3.py`: iteration 3 tests.
+- `tests/test_projects/02_relocs/`, `tests/test_projects/03_winapi_messagebox/`: test PEs.
+- `tests/pytest/test_iteration3.py`, `test_iteration4.py`: iteration tests.
 - `tests/pytest/conftest.py`: build/run helpers.
 - `tests/audit_pe.py`: PE audit.
 
@@ -41,7 +65,9 @@ pytest tests\pytest -v
 ```
 
 ## Remaining Work (next iterations)
-- Iteration 4: fake PEB/TEB/environment + import stand-ins. Compiled-in module table; emulated `LoadLibraryA`/`GetProcAddress` stand-ins. Tests: `03_winapi_messagebox`, `04_crt_printf_rand`, `09_resources`.
+- Iteration 4 remainder: `04_crt_printf_rand` (CRT pieces — enumerate its real
+  PE imports before coding handlers) and `09_resources`
+  (FindResourceA/SizeofResource stand-ins). Both then run in Release + Debug.
 - Iteration 5: CRT basics. Tests: `05_dll_entry`, `08_cpp_thread`.
 - Iteration 6: exceptions (x64 table-based first, then x86 VEH). Tests: `07_cpp_exceptions`, `11_cpp_exceptions`, `12_seh_exceptions`, `15_nested_exceptions`.
 - Iteration 7: hardening + docs.
@@ -54,4 +80,10 @@ pytest tests\pytest -v
 - Keep code comments minimal (why only).
 
 ## Immediate Next Step
-Start iteration 4: inspect how import stand-ins should be added, create test PE `03_winapi_messagebox`, implement emulated `LoadLibraryA`/`GetProcAddress`, add tests, run Release + Debug pytest, commit.
+Finish iteration 4: build test PE `04_crt_printf_rand` first, dump its import
+table (dumpbin or python pefile) and add the needed CRT stand-ins to
+`export_resolver.cpp` (printf/rand/srand/exit family — each needs real
+emulation, e.g. printf writes to stdout, rand is deterministic); extend
+`test_iteration4.py`. Then `09_resources` (FindResourceA + SizeofResource
+stand-ins validate RT_RCDATA/test-resource bytes exit). Run Release + Debug
+pytest (15 -> more), then commit each.

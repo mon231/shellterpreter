@@ -51,6 +51,7 @@ inline uint64_t doAdd(Emu& e, int sz, uint64_t a, uint64_t b) {
     flagsLogic(e, sz, res);
     return res;
 }
+inline void flagsNZP(Emu& e, int sz, uint64_t res);
 inline uint64_t doSubF(Emu& e, int sz, uint64_t a, uint64_t b) {
     const uint64_t aa = a & maskSz(sz), bb = b & maskSz(sz);
     const uint64_t res = (aa - bb) & maskSz(sz);
@@ -58,7 +59,7 @@ inline uint64_t doSubF(Emu& e, int sz, uint64_t a, uint64_t b) {
     const uint64_t sign = 1ull << (bitsSz(sz) - 1);
     e.of = (((aa ^ bb) & (aa ^ res)) & sign) != 0;
     e.af = ((aa ^ bb ^ res) & 0x10) != 0;
-    flagsLogic(e, sz, res);
+    flagsNZP(e, sz, res); // keep borrow in cf; flagsLogic would clear it
     return res;
 }
 
@@ -466,7 +467,27 @@ uint32_t step(Ctx& c) {
         else c.e.r[idx & 15] = v;
         return FAULT_NONE;
     }
-    case 0x60: case 0x61: case 0x62: case 0x63: case 0x82:
+    case 0x60: { // pusha: AX,CX,DX,BX,orig SP,BP,SI,DI
+        const uint32_t sp0 = static_cast<uint32_t>(c.e.r[4]);
+        const uint32_t vals[8] = { static_cast<uint32_t>(c.e.r[0]), static_cast<uint32_t>(c.e.r[1]),
+            static_cast<uint32_t>(c.e.r[2]), static_cast<uint32_t>(c.e.r[3]), sp0,
+            static_cast<uint32_t>(c.e.r[5]), static_cast<uint32_t>(c.e.r[6]), static_cast<uint32_t>(c.e.r[7]) };
+        for (int i = 0; i < 8; ++i)
+            if (!memSt<uint32_t>(c.e, c.e.r[4] - 4, vals[i])) return FAULT_OOB;
+        c.e.r[4] -= 32;
+        return FAULT_NONE;
+    }
+    case 0x61: { // popa: DI,SI,BP,SPIP(skip),BX,DX,CX,AX from lowest address
+        for (int i = 0; i < 8; ++i) {
+            uint32_t v = 0;
+            if (!memLd<uint32_t>(c.e, c.e.r[4], v)) return FAULT_OOB;
+            c.e.r[4] += 4;
+            const int idx = 7 - i;
+            if (idx != 4) c.e.r[idx] = v;
+        }
+        return FAULT_NONE;
+    }
+    case 0x62: case 0x63: case 0x82:
         return FAULT_UNSUPPORTED;
     case 0x68: {
         if (c.op66) return FAULT_UNSUPPORTED;
@@ -1066,13 +1087,18 @@ uint32_t run86(Loaded& l) {
     const uint64_t sentinel32 = kSentinel & 0xFFFFFFFFull;
     for (;;) {
         if (e.ip == sentinel32) break;
-        if (e.ip == l.ntEntry) {
-            // stand-in ntdll call: stdcall(RtlAddVectoredExceptionHandler), ret
-            // nonzero, callee pops args + ret addr
+        if (const ApiEntry* api = lookupApi(l, e.ip)) {
+            // compiled-in stand-in: stdcall, callee pops ret + args
+            uint64_t args[4] = { 0, 0, 0, 0 };
+            for (int i = 0; i < api->nargs && i < 4; ++i) {
+                uint32_t a = 0;
+                if (!memLd<uint32_t>(e, e.r[4] + 4 + 4 * i, a)) return FAULT_OOB;
+                args[i] = a;
+            }
             uint32_t ret = 0;
             if (!memLd<uint32_t>(e, e.r[4], ret)) return FAULT_OOB;
-            e.r[4] += 12;
-            e.r[0] = 1;
+            e.r[4] += 4 * (1 + api->nargs);
+            e.r[0] = static_cast<uint32_t>(api->fn(l, args));
             e.ip = ret;
             continue;
         }

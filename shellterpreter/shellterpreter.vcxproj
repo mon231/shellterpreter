@@ -120,12 +120,14 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="export_resolver.cpp" />
     <ClCompile Include="vm64.cpp" />
     <ClCompile Include="vm86.cpp" />
     <ClCompile Include="audit.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vm.hpp" />
+    <ClInclude Include="export_resolver.hpp" />
     <ClInclude Include="audit.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

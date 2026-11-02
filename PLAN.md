@@ -102,6 +102,23 @@ there.
 - Compiled-in module table; emulated `LoadLibraryA`/`GetProcAddress`/...
   stand-ins executed natively inside shellterpreter.
 - Tests: `03_winapi_messagebox`, `04_crt_printf_rand`, `09_resources`.
+- Status: `03_winapi_messagebox` complete (x64 + x86, exit 102; negative
+  checks covered). `export_resolver.{hpp,cpp}` build the fake env (TEB/PEB/Ldr
+  chain, fake kernel32 + ntdll PE headers with export dirs, user32 module
+  token) and register compiled-in stand-ins
+  (LoadLibraryA/GetProcAddress/MessageBoxA/RtlAdd*). vm64/vm86 run loops
+  intercept calls at stand-in addresses; x64 = SysV-free MS x64 ABI via
+  RCX/RDX/R8/R9 + shadow space, x86 = stdcall with callee-cleaned args.
+- vm64 `ApiEntry/Loaded/lookupApi` replaced iteration-2's per-call ntdll hook.
+- Root fixes: vm64 stands-in args read RCX not RAX; both cores' `doSubF`
+  used `flagsLogic` (clears CF — broke `cmp`+`ja` in the MZ-scan stubs) now
+  uses `flagsNZP`; ordinal/import-name threshold `kOrdinalMax = 0x10000`
+  (stub ordinals are masked 0xffff, name pointers >= imgBase >= 0x10000);
+  vm86 added `pusha`/`popa` (IMPORTS_32 opens with `pushal`).
+- Liberation: env layout documented in `export_resolver.cpp` header comment.
+- pytest: 15 passed in Release and Debug (incl. audit tests).
+- Remaining for this iteration: `04_crt_printf_rand` (enumerate its real PE
+  imports first), `09_resources` (FindResourceA/SizeofResource stand-ins).
 
 ### Iteration 5 — CRT basics
 - Tests: `05_dll_entry`, `08_cpp_thread` (threads as interpreter-driven

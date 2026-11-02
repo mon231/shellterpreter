@@ -51,6 +51,7 @@ inline uint64_t doAdd(Emu& e, int sz, uint64_t a, uint64_t b) {
     flagsLogic(e, sz, res);
     return res;
 }
+inline void flagsNZP(Emu& e, int sz, uint64_t res);
 inline uint64_t doSubF(Emu& e, int sz, uint64_t a, uint64_t b) {
     const uint64_t aa = a & maskSz(sz), bb = b & maskSz(sz);
     const uint64_t res = (aa - bb) & maskSz(sz);
@@ -58,7 +59,7 @@ inline uint64_t doSubF(Emu& e, int sz, uint64_t a, uint64_t b) {
     const uint64_t sign = 1ull << (bitsSz(sz) - 1);
     e.of = (((aa ^ bb) & (aa ^ res)) & sign) != 0;
     e.af = ((aa ^ bb ^ res) & 0x10) != 0;
-    flagsLogic(e, sz, res);
+    flagsNZP(e, sz, res); // keep borrow in cf; flagsLogic would clear it
     return res;
 }
 
@@ -1136,30 +1137,37 @@ uint32_t run64(Loaded& l) {
 
     for (;;) {
         if (e.ip == kSentinel) break;
-        if (e.ip == l.ntEntry) {
-            // stand-in ntdll call: x64 ABI, args in regs, caller cleans
+        if (const ApiEntry* api = lookupApi(l, e.ip)) {
+            // compiled-in stand-in: x64 ABI, caller cleans stack
             uint64_t ret = 0;
             if (!memLd<uint64_t>(e, e.r[kRSP], ret)) return FAULT_OOB;
-            e.r[kRSP] += 8;
-            e.r[0] = 1;
+            e.r[kRSP] += 8; // [rsp+0x28] arg5 at call entry = [rsp+0x20] here
+            uint64_t args[4] = { e.r[1], e.r[2], e.r[8], e.r[9] };
+            for (int i = 4; i < api->nargs && i < 8; ++i) {
+                if (!memLd<uint64_t>(e, e.r[kRSP] + 0x20 + 8 * (i - 4), args[i]))
+                    return FAULT_OOB;
+            }
+            e.r[0] = api->fn(l, args);
             e.ip = ret;
             continue;
         }
         if (e.budget == 0) return FAULT_LIMIT;
         --e.budget;
         if (e.ip < l.imgBase || e.ip >= e.imgEnd) {
-            fprintf(stderr, "instruction fetch outside image: ip=0x%llX\n",
-                    static_cast<unsigned long long>(e.ip));
+            fprintf(stderr, "instruction fetch outside image: ip=0x%llX (off=0x%llX)\n",
+                    (unsigned long long)e.ip,
+                    (unsigned long long)(e.ip - l.imgBase));
             return FAULT_OOB;
         }
         Fetch f{l.img, l.imgLen, static_cast<size_t>(e.ip - l.imgBase)};
         Ctx c{e, l, f, e.ip};
         const uint32_t r = stepOne(c);
         if (r != FAULT_NONE) {
-            fprintf(stderr, "fault r[0..3]=%llX %llX %llX %llX r10=%llX r11=%llX\n",
-                    (unsigned long long)e.r[0], (unsigned long long)e.r[8],
-                    (unsigned long long)e.r[2], (unsigned long long)e.r[9],
-                    (unsigned long long)e.r[10], (unsigned long long)e.r[11]);
+            fprintf(stderr, "fault ipoff=0x%llX r0=%llX rcx=%llX rsp=%llX rsi=%llX rdi=%llX rbx=%llX\n",
+                    (unsigned long long)(e.ip - l.imgBase), (unsigned long long)e.r[0],
+                    (unsigned long long)e.r[1], (unsigned long long)e.r[4],
+                    (unsigned long long)e.r[6], (unsigned long long)e.r[7],
+                    (unsigned long long)e.r[3]);
             if (r == FAULT_OOB) {
                 fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX\n",
                         static_cast<unsigned long long>(e.ip));
