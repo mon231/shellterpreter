@@ -1,0 +1,41 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install peor and pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install peor pytest
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Run pytest (builds x64 and x86, runs shellcode and audits)
+        run: python -m pytest tests/pytest -q
+
+      - name: Upload x64 interpreter
+        uses: actions/upload-artifact@v4
+        with:
+          name: shellterpreter-x64
+          path: Win_x64/shellterpreter.exe
+          if-no-files-found: error
+
+      - name: Upload x86 interpreter
+        uses: actions/upload-artifact@v4
+        with:
+          name: shellterpreter-x86
+          path: Win_x86/shellterpreter.exe
+          if-no-files-found: error

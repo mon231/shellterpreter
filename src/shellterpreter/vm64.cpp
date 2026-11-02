@@ -23,6 +23,11 @@ struct Emu {
     uint64_t budget = kInstrBudget;
 };
 
+inline unsigned popcnt8(uint8_t v) {
+    unsigned n = 0;
+    while (v) { n += v & 1; v >>= 1; }
+    return n;
+}
 constexpr uint64_t kWmask[9] = { 0, 0xFF, 0xFFFF, 0, 0xFFFFFFFFull, 0, 0, 0, ~0ull };
 constexpr unsigned kWbits[9] = { 0, 8, 16, 0, 32, 0, 0, 0, 64 };
 inline uint64_t maskSz(int sz) { return kWmask[sz]; }
@@ -33,7 +38,7 @@ inline void flagsLogic(Emu& e, int sz, uint64_t res) {
     res &= maskSz(sz);
     e.zf = res == 0;
     e.sf = (res & (1ull << (bitsSz(sz) - 1))) != 0;
-    e.pf = (__popcnt64(res & 0xFF) % 2) == 0;
+    e.pf = (popcnt8(static_cast<uint8_t>(res & 0xFF)) % 2) == 0;
 }
 inline uint64_t doAdd(Emu& e, int sz, uint64_t a, uint64_t b) {
     const uint64_t sum = (a & maskSz(sz)) + (b & maskSz(sz));
@@ -314,7 +319,7 @@ inline void flagsNZP(Emu& e, int sz, uint64_t res) {
     res &= maskSz(sz);
     e.zf = res == 0;
     e.sf = (res & (1ull << (bitsSz(sz) - 1))) != 0;
-    e.pf = (__popcnt64(res & 0xFF) % 2) == 0;
+    e.pf = (popcnt8(static_cast<uint8_t>(res & 0xFF)) % 2) == 0;
 }
 inline uint64_t adcOp(Emu& e, int sz, uint64_t a, uint64_t b, uint64_t cf) {
     const uint64_t m = maskSz(sz);
