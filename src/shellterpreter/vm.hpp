@@ -36,6 +36,10 @@ struct Loaded {
     size_t   stkLen;
     uint64_t stkBase;
     uint64_t fsBase;
+    uint8_t* env;
+    size_t   envLen;
+    uint64_t envBase;
+    uint64_t ntEntry;
     PeInfo   pe;
     bool     is64;
     bool     hasImage;

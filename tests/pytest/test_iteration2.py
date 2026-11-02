@@ -8,7 +8,6 @@ def _run_x86(exe_dir, sc):
     return conftest.run([str(exe), str(sc)])
 
 
-@pytest.mark.xfail(reason="x86 stub needs fs:[0x30] PEB walk stand-ins (iteration 4)", strict=True)
 def test_calc_x86():
     r = _run_x86(conftest.X86_DIR, conftest.X86_DIR / "01_simple_calc.shellcode")
     assert r.returncode == 4950, (conftest.win_code(r.returncode), r.stderr[-2000:])

@@ -20,7 +20,7 @@ struct Emu {
     bool cf = false, of = false, sf = false, zf = false, pf = false, af = false, df = false;
     Loaded* l = nullptr;
     uint64_t imgEnd = 0, stkEnd = 0;
-    uint64_t fsBase = 0;
+    uint64_t fsBase = 0, envBase = 0, envEnd = 0;
     uint64_t budget = kInstrBudget;
 };
 
@@ -80,6 +80,8 @@ template <class T> uint8_t* addrPtr(Emu& e, uint64_t addr) {
         return e.l->img + (addr - e.l->imgBase);
     if (addr >= e.l->stkBase && addr + sizeof(T) <= e.stkEnd)
         return e.l->stk + (addr - e.l->stkBase);
+    if (addr >= e.envBase && addr + sizeof(T) <= e.envEnd)
+        return e.l->env + (addr - e.envBase);
     return nullptr;
 }
 template <class T> bool memLd(Emu& e, uint64_t addr, T& out) {
@@ -214,6 +216,7 @@ struct Ctx {
     int rexW = 0, rexR = 0, rexX = 0, rexB = 0;
     bool op66 = false, rexUsed = false;
     int segFs = 0;
+    bool rep = false;
     uint32_t fault = FAULT_NONE;
     MR mr;
     Oprm o{};  // r/m operand after decodeRm
@@ -384,7 +387,8 @@ uint32_t stepOne(Ctx& c) {
         case 0x66: c.op66 = true; ++f.pos; continue;
         case 0x67: ++f.pos; continue;
         case 0x64: c.segFs = 1; ++f.pos; continue;
-        case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x65: case 0xF3:
+        case 0xF3: c.rep = true; ++f.pos; continue;
+        case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x65:
             ++f.pos;
             continue;
         default:
@@ -623,7 +627,7 @@ uint32_t step(Ctx& c) {
         return FAULT_NONE;
     }
     case 0xA0: case 0xA1: case 0xA2: case 0xA3: {
-        const uint32_t addr = f.u32();
+        const uint32_t addr = f.u32() + (c.segFs ? static_cast<uint32_t>(c.e.fsBase) : 0);
         const int osz = c.op66 ? 2 : 4;
         if (op == 0xA0 || op == 0xA1) {
             uint64_t v = 0;
@@ -640,7 +644,24 @@ uint32_t step(Ctx& c) {
         }
         return FAULT_NONE;
     }
-    case 0xA4: case 0xA5: case 0xA6: case 0xA7:
+    case 0xA6: case 0xA7: {
+        const int sz = (op == 0xA6) ? 1 : (c.op66 ? 2 : 4);
+        const int step = c.e.df ? -1 : 1;
+        for (;;) {
+            uint64_t si = c.e.r[6] & maskSz(4);
+            uint64_t di = c.e.r[7] & maskSz(4);
+            if (sz == 1) { uint8_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 1, a, b); }
+            else if (sz == 2) { uint16_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 2, a, b); }
+            else { uint32_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 4, a, b); }
+            c.e.r[6] = (si + step) & maskSz(4);
+            c.e.r[7] = (di + step) & maskSz(4);
+            if (!c.rep) break;
+            --c.e.r[1];
+            if (c.e.r[1] == 0 || !c.e.zf) break;
+        }
+        return FAULT_NONE;
+    }
+    case 0xA4: case 0xA5:
     case 0xAA: case 0xAB: case 0xAE: case 0xAF:
         return FAULT_UNSUPPORTED;
     case 0xAC: case 0xAD: {
@@ -1011,6 +1032,19 @@ uint32_t step(Ctx& c) {
         }
     }
 
+    case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: {
+        const int osz = c.op66 ? 2 : 4;
+        const int idx = op & 7;
+        c.e.r[idx & 15] = doIncOp(c.e, osz, c.e.r[idx & 15]);
+        return FAULT_NONE;
+    }
+    case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
+        const int osz = c.op66 ? 2 : 4;
+        const int idx = op & 7;
+        c.e.r[idx & 15] = doDecOp(c.e, osz, c.e.r[idx & 15]);
+        return FAULT_NONE;
+    }
+
     default:
         return FAULT_UNSUPPORTED;
     }
@@ -1022,6 +1056,8 @@ uint32_t run86(Loaded& l) {
     e.imgEnd = l.imgBase + l.imgLen;
     e.stkEnd = l.stkBase + l.stkLen;
     e.fsBase = l.fsBase;
+    e.envBase = l.envBase;
+    e.envEnd = l.envBase + l.envLen;
 
     e.r[kRSP] = e.stkEnd - 4;
     if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
@@ -1030,6 +1066,16 @@ uint32_t run86(Loaded& l) {
     const uint64_t sentinel32 = kSentinel & 0xFFFFFFFFull;
     for (;;) {
         if (e.ip == sentinel32) break;
+        if (e.ip == l.ntEntry) {
+            // stand-in ntdll call: stdcall(RtlAddVectoredExceptionHandler), ret
+            // nonzero, callee pops args + ret addr
+            uint32_t ret = 0;
+            if (!memLd<uint32_t>(e, e.r[4], ret)) return FAULT_OOB;
+            e.r[4] += 12;
+            e.r[0] = 1;
+            e.ip = ret;
+            continue;
+        }
         if (e.budget == 0) return FAULT_LIMIT;
         --e.budget;
         if (e.ip < l.imgBase || e.ip >= e.imgEnd) {
@@ -1040,7 +1086,6 @@ uint32_t run86(Loaded& l) {
         Fetch f{l.img, l.imgLen, static_cast<size_t>(e.ip - l.imgBase)};
         Ctx c{e, l, f, e.ip};
         const uint32_t r = stepOne(c);
-        fprintf(stderr, "debug: fault 0x%X ip=0x%llX\n", r, static_cast<unsigned long long>(e.ip));
         if (r != FAULT_NONE) {
             if (r == FAULT_OOB) {
                 fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX\n",

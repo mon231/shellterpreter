@@ -83,10 +83,11 @@ there.
 
 ### Iteration 2 - x86 importless shellcode
 - 32-bit core, same contract. Tests: 01_simple_calc Win32.
-- Status: core runs but peor's x86 stub does fs:[0x30] PEB walk and
-  resolves AddVectoredExceptionHandler from a module export table, so the
-  calc test is xfail until the Iteration 4 stand-ins land. fs-prefix and
-  moffs (A0-A3) handling already added.
+- Status: complete. peor's x86 stub does fs:[0x30] PEB walk and resolves
+  AddVectoredExceptionHandler from an ntdll export table; fake TEB/PEB/Ldr/
+  ntdll stand-ins built by the loader (one extra RW region, never
+  executable), NT-function calls intercepted by the interpreter loop.
+  x64 exe runs x86 shellcode via --x86 flag (all memory kept below 4 GB).
 
 ### Iteration 3 — base relocations
 - Tests: `02_relocs_functions` (static globals + .reloc),

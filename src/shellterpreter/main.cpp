@@ -10,9 +10,12 @@
 
 namespace stub {
 
+static uint32_t buildPebEnv(Loaded& l);
+
 void freeLoaded(Loaded& l) {
     if (l.img) { VirtualFree(l.img, 0, MEM_RELEASE); l.img = nullptr; }
     if (l.stk) { VirtualFree(l.stk, 0, MEM_RELEASE); l.stk = nullptr; }
+    if (l.env) { VirtualFree(l.env, 0, MEM_RELEASE); l.env = nullptr; }
 }
 
 std::string faultMessage(uint32_t fault) {
@@ -30,7 +33,17 @@ std::string faultMessage(uint32_t fault) {
     }
 }
 
-uint32_t loadShellcode(const std::string& path, Loaded& out) {
+static void* allocLow(size_t sz) {
+    // x86 core addresses everything through 32-bit registers/pointers; keep all
+    // regions below 4 GB even in a 64-bit process
+    for (uintptr_t a = 0x10000; a < 0x80000000ull; a += 0x10000) {
+        void* p = VirtualAlloc(reinterpret_cast<void*>(a), sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (p) return p;
+    }
+    return VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return FAULT_BAD_FILE;
@@ -65,8 +78,9 @@ uint32_t loadShellcode(const std::string& path, Loaded& out) {
         break;
     }
 
+    const bool low = !out.is64;
     const size_t want = data.size() + 0x10000;
-    void* buf = VirtualAlloc(nullptr, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    void* buf = low ? allocLow(want) : VirtualAlloc(nullptr, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!buf) return FAULT_ALLOC;
     uint8_t* base = static_cast<uint8_t*>(buf);
     memcpy(base, data.data(), data.size());
@@ -76,7 +90,7 @@ uint32_t loadShellcode(const std::string& path, Loaded& out) {
     out.imgBase = reinterpret_cast<uint64_t>(base);
     out.pe.imageOffset = imgOff;
     out.hasImage = hasImage;
-    out.is64 = (machine == 0x8664) || !hasImage;
+    out.is64 = hasImage ? (machine == 0x8664) : !force86;
 
     if (hasImage) {
         const uint32_t eLfanew = *reinterpret_cast<const uint32_t*>(base + imgOff + 0x3C);
@@ -92,11 +106,51 @@ uint32_t loadShellcode(const std::string& path, Loaded& out) {
     }
 
     const size_t kStack = 4 * 1024 * 1024;
-    void* stk = VirtualAlloc(nullptr, kStack, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    void* stk = low ? allocLow(kStack) : VirtualAlloc(nullptr, kStack, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!stk) { VirtualFree(buf, 0, MEM_RELEASE); return FAULT_ALLOC; }
     out.stk = static_cast<uint8_t*>(stk);
     out.stkLen = kStack;
     out.stkBase = reinterpret_cast<uint64_t>(stk);
+
+    const uint32_t err = buildPebEnv(out);
+    if (err != FAULT_NONE) { freeLoaded(out); return err; }
+    return FAULT_NONE;
+}
+
+// Fake x86 OS environment: TEB->PEB->Ldr->modules + fake ntdll image with a
+// single export "RtlAddVectoredExceptionHandler" whose implementation is a
+// reserved stand-in address the interpreter intercepts before any fetch.
+static uint32_t buildPebEnv(Loaded& l) {
+    constexpr size_t kEnv = 0x2000;
+    void* p = allocLow(kEnv);
+    if (!p) return FAULT_ALLOC;
+    uint8_t* m = static_cast<uint8_t*>(p);
+    l.env = m;
+    l.envLen = kEnv;
+    l.envBase = reinterpret_cast<uint64_t>(m);
+    auto put32 = [m](uint32_t off, uint32_t v) { memcpy(m + off, &v, 4); };
+    auto put16 = [m](uint32_t off, uint16_t v) { memcpy(m + off, &v, 2); };
+    const uint32_t B = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m));
+    l.fsBase = l.envBase + 0x100;
+    put32(0x130, B + 0x200);                // TEB+0x30 = PEB (absolute)
+    put32(0x20C, B + 0x300);                // PEB+0x0C = Ldr (absolute)
+    put32(0x314, B + 0x400);                // Ldr+0x14 = InMemoryOrderModuleList.Flink
+    put32(0x400, B + 0x500);                // exe entry next = ntdll entry
+    put32(0x510, B + 0x1000);               // ntdll entry +0x10 = DllBase
+    m[0x1000] = 'M'; m[0x1001] = 'Z';       // fake ntdll image starts at RVA space 0x1000
+    put32(0x103C, 0x40);                    // e_lfanew (RVA, added to base by stub)
+    m[0x1040] = 'P'; m[0x1041] = 'E'; m[0x1042] = 0; m[0x1043] = 0;
+    put32(0x10B8, 0x200);                   // [ntdll+0x40+0x78] = exports dir RVA
+    l.ntEntry = l.envBase + (0x1000 + 0x10);
+    put32(0x1010, B + 0x1440);              // stand-in "code": dword stub reads via mov esi,[esi]
+    put32(0x1218, 1);                       // NumberOfNames
+    put32(0x121C, 0x240);                   // AddressOfFunctions
+    put32(0x1220, 0x250);                   // AddressOfNames
+    put32(0x1224, 0x248);                   // AddressOfNameOrdinals
+    put32(0x1440, 0x10);                    // function[0] RVA = stand-in
+    put16(0x1448, 0);                       // ordinal[0]
+    put32(0x1450, 0x280);                   // names[0] RVA
+    memcpy(m + 0x1480, "RtlAddVectoredExceptionHandler", 31);
     return FAULT_NONE;
 }
 
@@ -125,7 +179,7 @@ int main(int argc, char** argv) {
     stub::Loaded l{};
     l.img = l.stk = nullptr;
     l.is64 = l.hasImage = false;
-    uint32_t err = stub::loadShellcode(path, l);
+    uint32_t err = stub::loadShellcode(path, l, arch == 32);
     if (err != stub::FAULT_NONE) { printFault(err); return static_cast<int>(err); }
 
     if (!l.hasImage) {
