@@ -84,8 +84,6 @@ pytest tests\pytest -v
 ```
 
 ## Remaining Work (next iterations)
-- Iteration 4 remainder: `09_resources` (FindResourceA/SizeofResource
-  stand-ins). Release + Debug.
 - Iteration 5: CRT basics + threads. Tests: `05_dll_entry`, `08_cpp_thread`
   (`std::thread` must work: interpreter runs thread entry points as its own
   emulated contexts; stand-in/syscall entry points take parameters from
@@ -101,8 +99,8 @@ pytest tests\pytest -v
 - Keep code comments minimal (why only).
 
 ## Immediate Next Step
-Finish iteration 4 with `09_resources`: add a `.rc` resource to a test PE,
-dump its real imports, add FindResourceA + SizeofResource stand-ins to
-`export_resolver.cpp` (exit code validates RT_RCDATA/test-resource byte count),
-extend `test_iteration4.py`, run Release + Debug pytest, commit. Then start
-iteration 5 (CRT basics + threads, `std::thread` included).
+Iteration 4 is complete (`03`, `04`, `09`, arch dispatch; 20 pytest green in
+Release and Debug). Start iteration 5 (CRT basics + threads), beginning with
+`08_cpp_thread`: dump its real imports, then add the thread stand-ins
+(CreateThread etc.) driven by interpreter-owned globals, and run
+`std::thread` shellcode entry points as emulated contexts.

@@ -45,6 +45,16 @@ def test_crt_x86():
     _check_crt(conftest.X86_DIR)
 
 
+def test_resources_x64():
+    r = _run(conftest.X64_DIR, "09_resources")
+    assert r.returncode == 600, (conftest.win_code(r.returncode), r.stderr[-2000:])
+
+
+def test_resources_x86():
+    r = _run(conftest.X86_DIR, "09_resources")
+    assert r.returncode == 600, (conftest.win_code(r.returncode), r.stderr[-2000:])
+
+
 def test_arch_dispatch():
     # x64 interpreter runs x86 shellcode
     sc = conftest.X86_DIR / "03_winapi_messagebox.shellcode"

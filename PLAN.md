@@ -133,7 +133,17 @@ there.
 - Arch dispatch: x64 interpreter runs x64 and x86 shellcode; the 32-bit
   interpreter runs x86 only and fails closed with `0xE0000007` on x64
   shellcode (`test_arch_dispatch`).
-- `09_resources` (FindResourceA/SizeofResource stand-ins) still open.
+- `09_resources` complete (x64 + x86, exit 600): real PE imports
+  enumerated from the built exe = one module `KERNEL32.dll` with
+  `FindResourceA`, `SizeofResource` (by name). Stand-ins parse the
+  shellcode's own mapped PE image: the resource directory entry is read
+  from the PE data directory, and every directory offset is relative to
+  the resource section RVA (name strings, subdirectory offsets, data
+  entries). `FindResourceA` matches type -> name -> language (any language
+  fallback) and returns the guest address of the leaf
+  `IMAGE_RESOURCE_DATA_ENTRY`; `SizeofResource` reads that entry's `Size`.
+  Missing resources return NULL, a bad handle returns 0.
+- Iteration 4 complete: pytest 20 passed in Release and Debug.
 
 ### Iteration 5 — CRT basics
 - Tests: `05_dll_entry`, `08_cpp_thread` (threads as interpreter-driven

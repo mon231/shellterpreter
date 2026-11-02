@@ -53,7 +53,7 @@ struct Loaded {
     uint8_t* env;
     size_t   envLen;
     uint64_t envBase;
-    ApiEntry apis[8];
+    ApiEntry apis[16];
     uint32_t apiCount;
     PeInfo   pe;
     bool     is64;

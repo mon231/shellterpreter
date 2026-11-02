@@ -28,6 +28,8 @@ constexpr uint32_t ST_NT_A    = 0x1010;
 constexpr uint32_t ST_PRINTF_A = 0x1D00;
 constexpr uint32_t ST_SRAND_A  = 0x1D10;
 constexpr uint32_t ST_RAND_A   = 0x1D20;
+constexpr uint32_t ST_FIND_RES_A = 0x1D30;
+constexpr uint32_t ST_SIZE_RES_A = 0x1D40;
 constexpr uint32_t MSVCRT_RVA  = 0x1E00;
 }
 
@@ -102,6 +104,8 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "printf"))        return l.envBase + ST_PRINTF_A;
     if (nameEq(name, "srand"))         return l.envBase + ST_SRAND_A;
     if (nameEq(name, "rand"))          return l.envBase + ST_RAND_A;
+    if (nameEq(name, "FindResourceA")) return l.envBase + ST_FIND_RES_A;
+    if (nameEq(name, "SizeofResource")) return l.envBase + ST_SIZE_RES_A;
     return 0;
 }
 
@@ -173,6 +177,104 @@ static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
     out[n] = '\0';
     fwrite(out, 1, n, stdout);
     return n;
+}
+
+// resource stand-ins: the shellcode's own mapped PE image is in guest memory,
+// so FindResourceA/SizeofResource walk its real resource directory
+static bool imgRead(const Loaded& l, uint64_t off, void* dst, size_t n) {
+    if (!l.hasImage) return false;
+    const uint64_t avail = l.imgLen > l.pe.imageOffset ? l.imgLen - l.pe.imageOffset : 0;
+    if (off > avail || n > avail - off) return false;
+    memcpy(dst, l.img + l.pe.imageOffset + off, n);
+    return true;
+}
+
+static bool resBase(const Loaded& l, uint32_t& out) {
+    uint32_t lfanew = 0;
+    if (!imgRead(l, 0x3C, &lfanew, 4)) return false;
+    uint16_t magic = 0;
+    if (!imgRead(l, lfanew + 0x18, &magic, 2)) return false;
+    const uint32_t dd = lfanew + 0x18 + (magic == 0x20B ? 0x70 : 0x60);
+    return imgRead(l, dd + 16, &out, 4) && out != 0;
+}
+
+// directory entry offsets are relative to the resource section base
+static bool resFind(const Loaded& l, uint32_t resRva, uint32_t rel, const char* name,
+                    uint32_t id, uint32_t& childRel, bool& isDir) {
+    uint16_t counts[2] = { 0, 0 };
+    if (!imgRead(l, resRva + rel + 12, counts, 4)) return false;
+    const uint32_t total = static_cast<uint32_t>(counts[0]) + counts[1];
+    for (uint32_t i = 0; i < total; ++i) {
+        uint32_t e[2] = { 0, 0 };
+        if (!imgRead(l, resRva + rel + 16 + 8 * i, e, 8)) return false;
+        bool match = false;
+        if (e[0] & 0x80000000u) {
+            if (name) {
+                const uint32_t nr = resRva + (e[0] & 0x7FFFFFFFu);
+                uint16_t len = 0;
+                if (!imgRead(l, nr, &len, 2)) continue;
+                bool eq = name[len] == '\0';
+                for (uint16_t k = 0; k < len && eq; ++k) {
+                    uint16_t c = 0;
+                    if (!imgRead(l, nr + 2 + 2 * k, &c, 2)) { eq = false; break; }
+                    eq = c == static_cast<uint8_t>(name[k]);
+                }
+                match = eq;
+            }
+        } else {
+            match = !name && e[0] == id;
+        }
+        if (!match) continue;
+        childRel = e[1] & 0x7FFFFFFFu;
+        isDir = (e[1] & 0x80000000u) != 0;
+        return true;
+    }
+    return false;
+}
+
+static bool resFirst(const Loaded& l, uint32_t resRva, uint32_t rel, uint32_t& childRel, bool& isDir) {
+    uint16_t counts[2] = { 0, 0 };
+    if (!imgRead(l, resRva + rel + 12, counts, 4) || counts[0] + counts[1] == 0) return false;
+    uint32_t e[2] = { 0, 0 };
+    if (!imgRead(l, resRva + rel + 16, e, 8)) return false;
+    childRel = e[1] & 0x7FFFFFFFu;
+    isDir = (e[1] & 0x80000000u) != 0;
+    return true;
+}
+
+static uint64_t apiFindResourceA(Loaded& l, const uint64_t* args) {
+    // the hosted module is the shellcode's own image; any handle is ignored
+    uint32_t res = 0;
+    if (!resBase(l, res)) return 0;
+    const uint64_t nameArg = args[1], typeArg = args[2];
+    uint32_t typeRel = 0, nameRel = 0, langRel = 0;
+    bool dir = false;
+    if (typeArg < 0x10000u) {
+        if (!resFind(l, res, 0, nullptr, static_cast<uint32_t>(typeArg), typeRel, dir) || !dir) return 0;
+    } else {
+        char tb[64];
+        if (!guestStr(l, typeArg, tb) || !resFind(l, res, 0, tb, 0, typeRel, dir) || !dir) return 0;
+    }
+    if (nameArg < 0x10000u) {
+        if (!resFind(l, res, typeRel, nullptr, static_cast<uint32_t>(nameArg), nameRel, dir) || !dir) return 0;
+    } else {
+        char nb[64];
+        if (!guestStr(l, nameArg, nb) || !resFind(l, res, typeRel, nb, 0, nameRel, dir) || !dir) return 0;
+    }
+    if (!resFind(l, res, nameRel, nullptr, 0x409, langRel, dir) || dir) {
+        if (!resFirst(l, res, nameRel, langRel, dir) || dir) return 0; // any language
+    }
+    // handle = guest address of the data entry, decoded again by SizeofResource
+    return l.imgBase + l.pe.imageOffset + res + langRel;
+}
+
+static uint64_t apiSizeofResource(Loaded& l, const uint64_t* args) {
+    const uint64_t imageGuest = l.imgBase + l.pe.imageOffset;
+    if (args[1] < imageGuest) return 0;
+    // IMAGE_RESOURCE_DATA_ENTRY: DataRVA, Size, CodePage, Reserved
+    uint32_t size = 0;
+    if (!imgRead(l, args[1] - imageGuest + 4, &size, 4)) return 0;
+    return size;
 }
 
 uint32_t buildFakeEnv(Loaded& l) {
@@ -252,6 +354,8 @@ uint32_t buildFakeEnv(Loaded& l) {
         { B + ST_PRINTF_A, 8, true, apiPrintf }, // cdecl: caller cleans
         { B + ST_SRAND_A, 1, true, apiSrand },
         { B + ST_RAND_A, 0, true, apiRand },
+        { B + ST_FIND_RES_A, 3, false, apiFindResourceA },
+        { B + ST_SIZE_RES_A, 2, false, apiSizeofResource },
     };
     l.apiCount = static_cast<uint32_t>(sizeof(apis) / sizeof(apis[0]));
     memcpy(l.apis, apis, sizeof(apis));
