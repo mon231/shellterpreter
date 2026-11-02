@@ -1,10 +1,14 @@
 # Build outputs
 Win_x86/
 Win_x64/
+Debug_x64/
+Debug_Win32/
 x64/
 Win32/
 bin/
 obj/
+Debug/
+Release/
 *.obj
 *.pdb
 *.exe

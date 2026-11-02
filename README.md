@@ -57,9 +57,9 @@ pytest tests\pytest -v
 
 | Path                   | What                                              |
 |------------------------|---------------------------------------------------|
-| `src/shellterpreter/`  | interpreter sources                               |
+| `shellterpreter/`     | interpreter sources                               |
 | `tests/test_projects/` | companion C++ test PEs (one per feature)          |
 | `tests/pytest/`        | pytest harness                                    |
-| `scripts/audit_pe.py`  | PE-structure checks used by the tests             |
+| `tests/audit_pe.py`    | PE-structure checks used by the tests             |
 | `.github/workflows/`   | CI: builds both configs, runs pytest, uploads exe |
 | `PLAN.md`              | roadmap, iteration log, user decisions            |

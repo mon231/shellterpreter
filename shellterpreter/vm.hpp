@@ -36,6 +36,7 @@ struct Loaded {
     size_t   stkLen;
     uint64_t stkBase;
     uint64_t fsBase;
+    uint64_t gsBase;
     uint8_t* env;
     size_t   envLen;
     uint64_t envBase;

@@ -5,7 +5,7 @@
 #include <cstring>
 
 namespace stub {
-namespace x86 {
+namespace x64 {
 
 enum Reg {
     kRAX = 0, kRCX, kRDX, kRBX, kRSP, kRBP, kRSI, kRDI,
@@ -20,7 +20,7 @@ struct Emu {
     bool cf = false, of = false, sf = false, zf = false, pf = false, af = false, df = false;
     Loaded* l = nullptr;
     uint64_t imgEnd = 0, stkEnd = 0;
-    uint64_t fsBase = 0, envBase = 0, envEnd = 0;
+    uint64_t fsBase = 0, gsBase = 0, envBase = 0, envEnd = 0;
     uint64_t budget = kInstrBudget;
 };
 
@@ -97,17 +97,14 @@ template <class T> bool memSt(Emu& e, uint64_t addr, T v) {
     return true;
 }
 inline bool push64(Emu& e, uint64_t v) {
-    constexpr uint64_t m = 0xFFFFFFFFull;
-    const uint64_t addr = e.r[kRSP] - 4;
-    if (!memSt<uint32_t>(e, addr, static_cast<uint32_t>(v & m))) return false;
+    const uint64_t addr = e.r[kRSP] - 8;
+    if (!memSt<uint64_t>(e, addr, v)) return false;
     e.r[kRSP] = addr;
     return true;
 }
 inline bool pop64(Emu& e, uint64_t& v) {
-    uint32_t w = 0;
-    if (!memLd(e, e.r[kRSP], w)) return false;
-    e.r[kRSP] += 4;
-    v = w;
+    if (!memLd<uint64_t>(e, e.r[kRSP], v)) return false;
+    e.r[kRSP] += 8;
     return true;
 }
 
@@ -214,8 +211,7 @@ struct Ctx {
     Fetch& f;
     uint64_t instStart;
     int rexW = 0, rexR = 0, rexX = 0, rexB = 0;
-    bool op66 = false, rexUsed = false;
-    int segFs = 0;
+    bool op66 = false, rexUsed = false;    int segGs = 0;
     bool rep = false;
     uint32_t fault = FAULT_NONE;
     MR mr;
@@ -229,7 +225,7 @@ struct Ctx {
         if (sz == 2) { e.r[idx & 15] = (e.r[idx & 15] & ~0xFFFFull) | (v & 0xFFFF); return; }
         e.r[idx & 15] = v;
     }
-    int operSz() const { return op66 ? 2 : 4; }
+    int operSz() const { return op66 ? 2 : (rexW ? 8 : 4); }
 
     uint32_t decodeRm() {
         if (fault != FAULT_NONE) return fault;
@@ -256,7 +252,7 @@ struct Ctx {
         } else {
             ea = e.r[mr.rm | (rexB << 3)] + mr.disp;
         }
-        if (segFs) ea += e.fsBase;
+        if (segGs) ea += e.gsBase;
         return ea;
     }
 
@@ -355,6 +351,30 @@ inline uint64_t sbbOp(Emu& e, int sz, uint64_t a, uint64_t b, uint64_t cf) {
     return res;
 }
 
+static void neg128(uint64_t& hi, uint64_t& lo) {
+    const uint64_t nl = ~lo + 1;
+    hi = ~hi + (lo == 0);
+    lo = nl;
+}
+
+// q must fit 64 bits (caller must not call when hi >= d); remainder always < d
+static uint64_t div128u(uint64_t hi, uint64_t lo, uint64_t d, uint64_t& rem) {
+    uint64_t rHi = 0, rLo = 0, qLo = 0;
+    for (int i = 127; i >= 0; --i) {
+        const uint64_t bit = (i >= 64) ? ((hi >> (i - 64)) & 1) : ((lo >> i) & 1);
+        rHi = (rHi << 1) | (rLo >> 63);
+        rLo = (rLo << 1) | bit;
+        const bool can = rHi != 0 || rLo >= d;
+        if (can) {
+            if (rLo >= d) rLo -= d;
+            else { --rHi; rLo -= d; }
+        }
+        qLo = (qLo << 1) | (can ? 1 : 0);
+    }
+    rem = rLo;
+    return qLo;
+}
+
 uint32_t aluOp(Ctx& c, int fam, uint64_t a, uint64_t b, int sz, uint64_t& out) {
     switch (fam) {
     case 0: out = doAdd(c.e, sz, a, b); return FAULT_NONE;
@@ -386,11 +406,22 @@ uint32_t stepOne(Ctx& c) {
         switch (p) {
         case 0x66: c.op66 = true; ++f.pos; continue;
         case 0x67: ++f.pos; continue;
-        case 0x64: c.segFs = 1; ++f.pos; continue;
-        case 0xF3: c.rep = true; ++f.pos; continue;
-        case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x65:
+        case 0x40: case 0x41: case 0x42: case 0x43:
+        case 0x44: case 0x45: case 0x46: case 0x47:
+        case 0x48: case 0x49: case 0x4A: case 0x4B:
+        case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
+            c.rexW = (p >> 3) & 1;
+            c.rexR = (p >> 2) & 1;
+            c.rexX = (p >> 1) & 1;
+            c.rexB = p & 1;
+            c.rexUsed = true;
             ++f.pos;
             continue;
+        }
+        case 0x65: c.segGs = 1; ++f.pos; continue;
+        case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x64:
+            ++f.pos; continue;
+        case 0xF3: c.rep = true; ++f.pos; continue;
         default:
             return step(c);
         }
@@ -466,8 +497,18 @@ uint32_t step(Ctx& c) {
         else c.e.r[idx & 15] = v;
         return FAULT_NONE;
     }
-    case 0x60: case 0x61: case 0x62: case 0x63: case 0x82:
+    case 0x60: case 0x61: case 0x62: case 0x82:
         return FAULT_UNSUPPORTED;
+    case 0x63: {
+        c.decodeRm();
+        if (c.fault != FAULT_NONE) return c.fault;
+        const uint64_t v = c.oVal(4);
+        if (c.fault != FAULT_NONE) return c.fault;
+        const uint64_t sx = sext(4, v);
+        if (c.rexW) c.gSet(8, sx); else c.gSet(4, sx);
+        if (c.fault != FAULT_NONE) return c.fault;
+        return FAULT_NONE;
+    }
     case 0x68: {
         if (c.op66) return FAULT_UNSUPPORTED;
         const uint32_t imm = f.u32();
@@ -627,43 +668,48 @@ uint32_t step(Ctx& c) {
         return FAULT_NONE;
     }
     case 0xA0: case 0xA1: case 0xA2: case 0xA3: {
-        const uint32_t addr = f.u32() + (c.segFs ? static_cast<uint32_t>(c.e.fsBase) : 0);
-        const int osz = c.op66 ? 2 : 4;
+        const uint64_t addr = f.u64() + (c.segGs ? c.e.gsBase : 0);
+        int osz;
+        if (op == 0xA0 || op == 0xA2) osz = 1;
+        else if (c.op66) osz = 2;
+        else osz = c.rexW ? 8 : 4;
         if (op == 0xA0 || op == 0xA1) {
             uint64_t v = 0;
-            if (osz == 2) { uint16_t w; if (!memLd(c.e, addr, w)) return FAULT_OOB; v = w; }
-            else { uint32_t w; if (!memLd(c.e, addr, w)) return FAULT_OOB; v = w; }
+            if (osz == 1) { uint8_t w; if (!memLd(c.e, addr, w)) return FAULT_OOB; v = w; }
+            else if (osz == 2) { uint16_t w; if (!memLd(c.e, addr, w)) return FAULT_OOB; v = w; }
+            else if (osz == 4) { uint32_t w; if (!memLd(c.e, addr, w)) return FAULT_OOB; v = w; }
+            else { if (!memLd(c.e, addr, v)) return FAULT_OOB; }
             if (op == 0xA0) c.reg8Write(0, v);
-            else if (osz == 2) c.e.r[0] = (c.e.r[0] & ~0xFFFFull) | v;
-            else c.e.r[0] = v;
+            else c.e.r[0] = (c.e.r[0] & ~maskSz(osz)) | (v & maskSz(osz));
         } else {
             const uint64_t v = (op == 0xA2) ? (c.e.r[0] & 0xFF) : (c.e.r[0] & maskSz(osz));
-            if (op == 0xA2) { if (!memSt(c.e, addr, static_cast<uint8_t>(v))) return FAULT_OOB; }
+            if (osz == 1) { if (!memSt(c.e, addr, static_cast<uint8_t>(v))) return FAULT_OOB; }
             else if (osz == 2) { if (!memSt(c.e, addr, static_cast<uint16_t>(v))) return FAULT_OOB; }
-            else { if (!memSt(c.e, addr, static_cast<uint32_t>(v))) return FAULT_OOB; }
+            else if (osz == 4) { if (!memSt(c.e, addr, static_cast<uint32_t>(v))) return FAULT_OOB; }
+            else { if (!memSt(c.e, addr, v)) return FAULT_OOB; }
         }
         return FAULT_NONE;
     }
+    case 0xA4: case 0xA5:
+    case 0xAA: case 0xAB: case 0xAE:
+        return FAULT_UNSUPPORTED;
     case 0xA6: case 0xA7: {
-        const int sz = (op == 0xA6) ? 1 : (c.op66 ? 2 : 4);
+        const int szCode = (op == 0xA6) ? 1 : (c.op66 ? 2 : (c.rexW ? 8 : 4));
         const int step = c.e.df ? -1 : 1;
         for (;;) {
-            uint64_t si = c.e.r[6] & maskSz(4);
-            uint64_t di = c.e.r[7] & maskSz(4);
-            if (sz == 1) { uint8_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 1, a, b); }
-            else if (sz == 2) { uint16_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 2, a, b); }
-            else { uint32_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 4, a, b); }
-            c.e.r[6] = (si + step) & maskSz(4);
-            c.e.r[7] = (di + step) & maskSz(4);
+            const uint64_t si = c.e.r[6], di = c.e.r[7];
+            if (szCode == 1) { uint8_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 1, a, b); }
+            else if (szCode == 2) { uint16_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 2, a, b); }
+            else if (szCode == 4) { uint32_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 4, a, b); }
+            else { uint64_t a, b; if (!memLd(c.e, si, a) || !memLd(c.e, di, b)) return FAULT_OOB; doSubF(c.e, 8, a, b); }
+            c.e.r[6] = (si + step) & maskSz(8);
+            c.e.r[7] = (di + step) & maskSz(8);
             if (!c.rep) break;
             --c.e.r[1];
             if (c.e.r[1] == 0 || !c.e.zf) break;
         }
         return FAULT_NONE;
     }
-    case 0xA4: case 0xA5:
-    case 0xAA: case 0xAB: case 0xAE: case 0xAF:
-        return FAULT_UNSUPPORTED;
     case 0xAC: case 0xAD: {
         const uint64_t si = c.e.r[6];
         if (op == 0xAC) {
@@ -673,7 +719,7 @@ uint32_t step(Ctx& c) {
             c.e.r[6] = si + 1;
             return FAULT_NONE;
         }
-        const int ls = c.op66 ? 2 : 4;
+        const int ls = c.op66 ? 2 : (c.rexW ? 8 : 4);
         uint64_t v = 0;
         if (ls == 2) { uint16_t t; if (!memLd(c.e, si, t)) { return FAULT_OOB; } v = t; }
         else if (ls == 4) { uint32_t t; if (!memLd(c.e, si, t)) { return FAULT_OOB; } v = t; }
@@ -896,7 +942,44 @@ uint32_t step(Ctx& c) {
             c.e.cf = c.e.of = (static_cast<uint64_t>(p) != sext(sz, res));
             return FAULT_NONE;
         }
-        case 6: case 7: return FAULT_UNSUPPORTED;
+        case 6: case 7: {
+            const bool unsignedDiv = (kind == 6);
+            if (sz == 8) {
+                if (!a) return FAULT_UNSUPPORTED;
+                uint64_t rem;
+                if (unsignedDiv) {
+                    if (c.e.r[2] >= a) return FAULT_UNSUPPORTED; // real CPU raises #DE here
+                    c.e.r[0] = div128u(c.e.r[2], c.e.r[0], a, rem);
+                } else {
+                    uint64_t hi = c.e.r[2], lo = c.e.r[0], dd = a;
+                    const bool n1 = (hi >> 63) != 0;
+                    const bool n2 = static_cast<int64_t>(dd) < 0;
+                    if (n1) neg128(hi, lo);
+                    if (n2) { uint64_t zh = 0; neg128(zh, dd); }
+                    const uint64_t q = div128u(hi, lo, dd, rem);
+                    c.e.r[0] = (n1 != n2) ? (~q + 1) : q;
+                    if (n1) rem = ~rem + 1;
+                }
+                c.e.r[2] = rem;
+                return FAULT_NONE;
+            }
+            const uint32_t d = static_cast<uint32_t>(a & 0xFFFFFFFFull);
+            if (!d) return FAULT_UNSUPPORTED;
+            const uint32_t lo = static_cast<uint32_t>(c.e.r[0]);
+            const uint32_t hi = static_cast<uint32_t>(c.e.r[2]);
+            if (unsignedDiv) {
+                const uint64_t n = (static_cast<uint64_t>(hi) << 32) | lo;
+                c.e.r[0] = static_cast<uint32_t>(n / d);
+                c.e.r[2] = static_cast<uint32_t>(n % d);
+            } else {
+                const int64_t n = (static_cast<int64_t>(static_cast<int32_t>(hi)) << 32) |
+                                  static_cast<uint32_t>(lo);
+                const int32_t ds = static_cast<int32_t>(d);
+                c.e.r[0] = static_cast<uint32_t>(static_cast<int32_t>(n / ds));
+                c.e.r[2] = static_cast<uint32_t>(static_cast<int32_t>(n % ds));
+            }
+            return FAULT_NONE;
+        }
         default: return FAULT_UNSUPPORTED;
         }
     }
@@ -918,7 +1001,7 @@ uint32_t step(Ctx& c) {
         const int kind = c.mr.reg;
         if (c.op66 && kind < 6) return FAULT_UNSUPPORTED;
         if (kind == 0 || kind == 1) {
-            const int osz = c.op66 ? 2 : 4;
+            const int osz = c.op66 ? 2 : (c.rexW ? 8 : 4);
             const uint64_t a = c.oVal(osz);
             if (c.fault != FAULT_NONE) return c.fault;
             if (kind == 0) c.oSet(osz, doIncOp(c.e, osz, a)); else c.oSet(osz, doDecOp(c.e, osz, a));
@@ -926,7 +1009,7 @@ uint32_t step(Ctx& c) {
             return FAULT_NONE;
         }
         if (kind == 2 || kind == 4) {
-            const uint64_t a = c.oVal(c.op66 ? 2 : 4);
+            const uint64_t a = c.oVal(8);
             if (c.fault != FAULT_NONE) return c.fault;
             const uint64_t nxt = c.l.imgBase + f.pos;
             if (kind == 2) { if (!push64(c.e, nxt)) return FAULT_OOB; }
@@ -935,7 +1018,7 @@ uint32_t step(Ctx& c) {
             return FAULT_NONE;
         }
         if (kind == 6) {
-            const uint64_t a = c.oVal(c.op66 ? 2 : 4);
+            const uint64_t a = c.oVal(8);
             if (c.fault != FAULT_NONE) return c.fault;
             return push64(c.e, a) ? FAULT_NONE : FAULT_OOB;
         }
@@ -1002,7 +1085,7 @@ uint32_t step(Ctx& c) {
             if (c.fault != FAULT_NONE) return c.fault;
             const uint64_t v = c.oVal(op2 == 0xB6 ? 1 : 2);
             if (c.fault != FAULT_NONE) return c.fault;
-            c.gSet(c.op66 ? 2 : 4, v);
+            c.gSet(c.rexW ? 8 : 4, v);
             if (c.fault != FAULT_NONE) return c.fault;
             return FAULT_NONE;
         }
@@ -1012,7 +1095,7 @@ uint32_t step(Ctx& c) {
             const int from = (op2 == 0xBE) ? 1 : 2;
             const uint64_t v = c.oVal(from);
             if (c.fault != FAULT_NONE) return c.fault;
-            c.gSet(c.op66 ? 2 : 4, sext(from, v));
+            c.gSet(c.rexW ? 8 : 4, sext(from, v));
             if (c.fault != FAULT_NONE) return c.fault;
             return FAULT_NONE;
         }
@@ -1032,46 +1115,32 @@ uint32_t step(Ctx& c) {
         }
     }
 
-    case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: {
-        const int osz = c.op66 ? 2 : 4;
-        const int idx = op & 7;
-        c.e.r[idx & 15] = doIncOp(c.e, osz, c.e.r[idx & 15]);
-        return FAULT_NONE;
-    }
-    case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
-        const int osz = c.op66 ? 2 : 4;
-        const int idx = op & 7;
-        c.e.r[idx & 15] = doDecOp(c.e, osz, c.e.r[idx & 15]);
-        return FAULT_NONE;
-    }
-
     default:
         return FAULT_UNSUPPORTED;
     }
 }
 
-uint32_t run86(Loaded& l) {
+uint32_t run64(Loaded& l) {
     Emu e;
     e.l = &l;
     e.imgEnd = l.imgBase + l.imgLen;
     e.stkEnd = l.stkBase + l.stkLen;
     e.fsBase = l.fsBase;
+    e.gsBase = l.gsBase;
     e.envBase = l.envBase;
     e.envEnd = l.envBase + l.envLen;
 
-    e.r[kRSP] = e.stkEnd - 4;
-    if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
+    e.r[kRSP] = e.stkEnd - 8;
+    if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return FAULT_OOB;
     e.ip = l.imgBase;
 
-    const uint64_t sentinel32 = kSentinel & 0xFFFFFFFFull;
     for (;;) {
-        if (e.ip == sentinel32) break;
+        if (e.ip == kSentinel) break;
         if (e.ip == l.ntEntry) {
-            // stand-in ntdll call: stdcall(RtlAddVectoredExceptionHandler), ret
-            // nonzero, callee pops args + ret addr
-            uint32_t ret = 0;
-            if (!memLd<uint32_t>(e, e.r[4], ret)) return FAULT_OOB;
-            e.r[4] += 12;
+            // stand-in ntdll call: x64 ABI, args in regs, caller cleans
+            uint64_t ret = 0;
+            if (!memLd<uint64_t>(e, e.r[kRSP], ret)) return FAULT_OOB;
+            e.r[kRSP] += 8;
             e.r[0] = 1;
             e.ip = ret;
             continue;
@@ -1087,6 +1156,10 @@ uint32_t run86(Loaded& l) {
         Ctx c{e, l, f, e.ip};
         const uint32_t r = stepOne(c);
         if (r != FAULT_NONE) {
+            fprintf(stderr, "fault r[0..3]=%llX %llX %llX %llX r10=%llX r11=%llX\n",
+                    (unsigned long long)e.r[0], (unsigned long long)e.r[8],
+                    (unsigned long long)e.r[2], (unsigned long long)e.r[9],
+                    (unsigned long long)e.r[10], (unsigned long long)e.r[11]);
             if (r == FAULT_OOB) {
                 fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX\n",
                         static_cast<unsigned long long>(e.ip));
@@ -1100,10 +1173,10 @@ uint32_t run86(Loaded& l) {
     return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
 }
 
-} // namespace x86
+} // namespace x64
 
-uint32_t run86(Loaded& l) {
-    return x86::run86(l);
+uint32_t run64(Loaded& l) {
+    return x64::run64(l);
 }
 
 } // namespace stub

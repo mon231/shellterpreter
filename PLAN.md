@@ -79,7 +79,7 @@ there.
   call/ret/movzx/lodsw/hlt ModRM/SIB/rip-relative), sentinel return, fault
   codes, runtime self-audit, test PE `01_simple_calc` (importless, custom
   entry, x64), pytest (shellcode runs, audit, fail-closed unknown opcode),
-  `scripts/audit_pe.py`, `tests/build_tests.py`.
+  `tests/audit_pe.py`, `tests/build_tests.py`.
 
 ### Iteration 2 - x86 importless shellcode
 - 32-bit core, same contract. Tests: 01_simple_calc Win32.
@@ -89,9 +89,14 @@ there.
   executable), NT-function calls intercepted by the interpreter loop.
   x64 exe runs x86 shellcode via --x86 flag (all memory kept below 4 GB).
 
-### Iteration 3 — base relocations
-- Tests: `02_relocs_functions` (static globals + .reloc),
-  `06_stripped_relocs` (/FIXED).
+### Iteration 3 — base relocations (complete)
+- Test project `02_relocs` (static globals + .reloc), expected exit 542.
+- x64 core: `rexUsed` flag fixed; byte-reg REX ops now decode correctly.
+- x86 core: `decodeMR` `rm=5/mod=0` fixed to absolute disp32 (`absDisp`).
+- x86 reloc stub patches verified POS-space (delta = vmInnerFileBase − ImageBase).
+- Debug builds isolated; `/INCREMENTAL:NO`; `conftest` supports `SHELLTERP_CONFIG=Debug`.
+- pytest: 13 passed (Release + Debug).
+- Next: iteration 4 (import stand-ins).
 
 ### Iteration 4 — fake PEB/TEB/environment + import stand-ins
 - Compiled-in module table; emulated `LoadLibraryA`/`GetProcAddress`/...
@@ -116,7 +121,7 @@ there.
 - `pytest tests\pytest` green, including audit tests.
 - Both platforms build: `python tests\build_tests.py Release x64` and
   `... Release Win32`.
-- `scripts/audit_pe.py` passes on shellterpreter.exe (both arch) and on all
+- `tests/audit_pe.py` passes on shellterpreter.exe (both arch) and on all
   test PEs: no RWX sections; no executable sections beyond the compile-time
   image's own (`.text` for shellterpreter; also allows the known test-PE
   sections).

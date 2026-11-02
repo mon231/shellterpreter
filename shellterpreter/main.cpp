@@ -132,25 +132,35 @@ static uint32_t buildPebEnv(Loaded& l) {
     auto put16 = [m](uint32_t off, uint16_t v) { memcpy(m + off, &v, 2); };
     const uint32_t B = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m));
     l.fsBase = l.envBase + 0x100;
-    put32(0x130, B + 0x200);                // TEB+0x30 = PEB (absolute)
-    put32(0x20C, B + 0x300);                // PEB+0x0C = Ldr (absolute)
-    put32(0x314, B + 0x400);                // Ldr+0x14 = InMemoryOrderModuleList.Flink
+    l.gsBase = l.envBase + 0x100;
+    l.ntEntry = l.envBase + (0x1000 + 0x10);
     put32(0x400, B + 0x500);                // exe entry next = ntdll entry
-    put32(0x510, B + 0x1000);               // ntdll entry +0x10 = DllBase
     m[0x1000] = 'M'; m[0x1001] = 'Z';       // fake ntdll image starts at RVA space 0x1000
     put32(0x103C, 0x40);                    // e_lfanew (RVA, added to base by stub)
     m[0x1040] = 'P'; m[0x1041] = 'E'; m[0x1042] = 0; m[0x1043] = 0;
-    put32(0x10B8, 0x200);                   // [ntdll+0x40+0x78] = exports dir RVA
-    l.ntEntry = l.envBase + (0x1000 + 0x10);
-    put32(0x1010, B + 0x1440);              // stand-in "code": dword stub reads via mov esi,[esi]
+    put32(0x1010, B + 0x1240);              // stand-in "code": dword stub reads via mov esi,[esi]
     put32(0x1218, 1);                       // NumberOfNames
-    put32(0x121C, 0x240);                   // AddressOfFunctions
-    put32(0x1220, 0x250);                   // AddressOfNames
-    put32(0x1224, 0x248);                   // AddressOfNameOrdinals
-    put32(0x1440, 0x10);                    // function[0] RVA = stand-in
-    put16(0x1448, 0);                       // ordinal[0]
-    put32(0x1450, 0x280);                   // names[0] RVA
-    memcpy(m + 0x1480, "RtlAddVectoredExceptionHandler", 31);
+    put32(0x121C, 0x240);                   // AddressOfFunctions (RVA)
+    put32(0x1220, 0x250);                   // AddressOfNames (RVA)
+    put32(0x1224, 0x248);                   // AddressOfNameOrdinals (RVA)
+    put32(0x1240, 0x10);                    // function[0] RVA = stand-in
+    put16(0x1248, 0);                       // ordinal[0]
+    put32(0x1250, 0x280);                   // names[0] RVA
+    if (l.is64) {
+        put32(0x160, B + 0x200);            // TEB+0x60 = PEB (x64 peb walk at gs:[0x60])
+        put32(0x218, B + 0x300);            // PEB+0x18 = Ldr
+        put32(0x320, B + 0x400);            // Ldr+0x20 = InMemoryOrderModuleList.Flink
+        put32(0x520, B + 0x1000);           // ntdll entry +0x20 = DllBase
+        put32(0x10C8, 0x200);               // [ntdll+0x40+0x88] = exports dir RVA (x64 dirs)
+        memcpy(m + 0x1280, "RtlAddFunctionTable", 19);
+    } else {
+        put32(0x130, B + 0x200);            // TEB+0x30 = PEB (x86 fs:[0x30])
+        put32(0x20C, B + 0x300);            // PEB+0x0C = Ldr (absolute)
+        put32(0x314, B + 0x400);            // Ldr+0x14 = InMemoryOrderModuleList.Flink
+        put32(0x510, B + 0x1000);           // ntdll entry +0x10 = DllBase
+        put32(0x10B8, 0x200);               // [ntdll+0x40+0x78] = exports dir RVA
+        memcpy(m + 0x1280, "RtlAddVectoredExceptionHandler", 31);
+    }
     return FAULT_NONE;
 }
 

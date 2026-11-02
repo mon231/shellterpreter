@@ -1,10 +1,13 @@
+import os
 import pathlib
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-X64_DIR = ROOT / "Win_x64"
-X86_DIR = ROOT / "Win_x86"
+# SHELLTERP_CONFIG=Debug runs the test suite against Debug_x64/Debug_Win32 exes.
+CONFIG = os.environ.get("SHELLTERP_CONFIG", "Release")
+X64_DIR = ROOT / ("Debug_x64" if CONFIG == "Debug" else "Win_x64")
+X86_DIR = ROOT / ("Debug_Win32" if CONFIG == "Debug" else "Win_x86")
 
 
 def win_code(rc: int) -> int:
