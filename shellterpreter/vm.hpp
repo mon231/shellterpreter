@@ -16,7 +16,7 @@ constexpr uint64_t kSentinel = 0x0000BAD0C0FFEE10ull;
 
 // One emulated guest thread. A stand-in creates it and the join stand-in runs
 // the entry function on its own stack (see runThread).
-struct ThreadCtx {
+struct ThreadContext {
     uint64_t handle;
     uint64_t entry;
     uint64_t arg;
@@ -35,7 +35,7 @@ struct Loaded {
     uint64_t heapNext;  // bump allocator cursor inside heap
     uint64_t heapEnd;
     ApiTable apis;
-    ThreadCtx threads[8];
+    ThreadContext threads[8];
     uint32_t threadCount;
     uint32_t fault; // stand-in sets this to fail closed
     PeInfo   pe;
@@ -54,8 +54,9 @@ uint32_t run86(Loaded& l);
 
 // Run a thread's guest entry on its own stack until it returns.
 // Semantics are join-driven: the thread runs at the first join/wait for it.
-uint32_t runThread(Loaded& l, ThreadCtx& t);
-uint32_t runThread64(Loaded& l, ThreadCtx& t);
-uint32_t runThread86(Loaded& l, ThreadCtx& t);
+uint32_t runThread(Loaded& l, ThreadContext& t);
+uint32_t runThread64(Loaded& l, ThreadContext& t);
+uint32_t runThread86(Loaded& l, ThreadContext& t);
 
 }
+

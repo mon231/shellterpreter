@@ -1529,7 +1529,7 @@ public:
 
     // Guest thread entry: sentinel return address on top, thread argument
     // in the first argument register (x64 MS ABI) or at [esp+4] (stdcall).
-    static uint32_t runThread(Loaded& l, ThreadCtx& t) {
+    static uint32_t runThread(Loaded& l, ThreadContext& t) {
         Emu e;
         initEntry(l, t.stack.base() + t.stack.size(), e);
         e.r[kRSP] = e.stkEnd - (is64 ? 8 : 4) - 0x100;
@@ -1549,3 +1549,4 @@ public:
 };
 
 } // namespace stub
+

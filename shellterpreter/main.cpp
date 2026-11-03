@@ -85,19 +85,14 @@ int main(int argc, char** argv) {
     if (l.is64) { printFault(fault_code(Fault::Architecture)); return fault_code(Fault::Architecture); }
 #endif
 
-    std::vector<stub::ExecRange> baseline = stub::snapshotExecRanges();
+    stub::ExecAudit audit{}; // snapshot after load, guest pages are data only
 
     uint32_t result = fault_code(Fault::None);
     if (l.is64) result = stub::run64(l);
     else result = stub::run86(l);
 
-    bool ok = true;
-    if (stub::pageHasExecute(l.img.base()) || stub::pageHasExecute(l.stk.base()) ||
-        stub::pageIsWriteAndExec(l.img.base()) || stub::pageIsWriteAndExec(l.stk.base())) {
-        ok = false;
+    if (!audit.verify(l.img.base(), l.stk.base()))
         result = fault_code(Fault::Audit);
-    }
-    if (ok && !stub::verifyNoNewExec(baseline)) { ok = false; result = fault_code(Fault::Audit); }
     if (result >= 0xE0000000u) { printFault(result); }
     return static_cast<int>(result);
 }

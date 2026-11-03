@@ -29,6 +29,60 @@ caller must pass `--x86` or `--x64`.
 
 See `PLAN.md` for the roadmap and the user decisions behind these choices.
 
+## Exit and fault codes
+
+The process exit code is the outcome of the run: for a shellcode that
+returns normally it is the low 32 bits of `RAX`/`EAX`; the range
+`0xE0000000..0xE0000009` is reserved for the interpreter's own diagnostics.
+
+| Code | Meaning |
+|---|---|
+| `0x00000000..0xDFFFFFFF` | low 32 bits of returned RAX/EAX |
+| `0xE0000001` | unimplemented opcode (fail closed) |
+| `0xE0000002` | access outside emulated memory |
+| `0xE0000003` | bad shellcode file |
+| `0xE0000004` | memory allocation failed |
+| `0xE0000005` | runtime self-audit violation |
+| `0xE0000006` | `hlt` executed (also ends a stub chain; exit is then EAX) |
+| `0xE0000007` | architecture mismatch (32-bit build + x64 shellcode, wrong `--x86`/`--x64` flag) |
+| `0xE0000008` | bad command line |
+| `0xE0000009` | instruction budget exhausted |
+
+## Design and choices
+
+- **Fail closed, never guessed.** An unknown or partial instruction is a
+  fault, not a best-effort decode. Stand-ins return faults on missing
+  state instead of writing zeros; import tables that overflow fail the
+  run; the audit compares executable regions before and after the run and
+  fails on any change.
+- **W^X by construction.** All guest memory lives in dedicated
+  `VirtualAlloc` regions created `PAGE_READWRITE` once and never
+  re-protected, so there is no JIT, no self-modification surface, and no
+  way for guest writes (including writes through emulated `memcpy`) to
+  create code that later runs.
+- **One CPU, one decoder.** The x64 and x86 cores are a single
+  `Cpu<Architecture>` template around one arch-tagged decoder. The two
+  instruction sets differ in real, known places (REX bytes vs 40–4F
+  inc/dec, RIP-relative vs absolute disp32, register-file widths, div/pusha
+  forms); every such place is resolved at compile time with `if constexpr`,
+  and the two cores cannot drift apart again.
+- **Interpreter-visible OS services are compiled in.** The fake
+  PEB/TEB/LDR environment, the WinAPI/CRT stand-in table (checked into an
+  `ApiTable`, O(1) address lookup) and CRT startup helpers are binary-resident
+  code, approved ahead of time — the guest never calls a real API.
+- **RAII for every system resource.** Guest regions, file handles, and the
+  executable-region audit are classes with destructors; the kernel handles
+  and allocations cannot leak on an early-out (the interpreter takes a
+  fault on almost any malformed input).
+- **Threads are emulated, join-driven.** `_beginthreadex`/`std::thread`
+  stand-ins create emulated threads that run on the first `_Thrd_join`
+  stand-in, keeping the interpreter itself single-threaded.
+- **A budget instead of a crash.** Instruction execution is bounded;
+  default 5,000,000,000, overridable via `SHELLTERP_BUDGET`. A runaway
+  guest exits with `0xE0000009` instead of hanging the host process.
+- **Test-first, both configs.** The pytest suite is the correctness gate
+  for every commit, run in Release AND Debug, on both x64 and x86 builds.
+
 ## Build
 
 pytest builds the solution itself. To build by hand from a *Developer

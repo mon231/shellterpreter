@@ -342,8 +342,8 @@ static uint64_t apiBeginThread(Loaded& l, const uint64_t* args) {
     uint64_t stackSize = static_cast<uint64_t>(args[1]);
     if (stackSize < 0x4000) stackSize = 0x40000; // default-ish, generous
     if (stackSize > 0x400000) stackSize = 0x400000;
-    ThreadCtx& t = l.threads[l.threadCount];
-    t = ThreadCtx{};
+    ThreadContext& t = l.threads[l.threadCount];
+    t = ThreadContext{};
     if (!t.stack.allocate(stackSize, true)) return 0;
     t.handle = 0x400ull + l.threadCount;
     t.entry = args[2];
@@ -376,7 +376,7 @@ static uint64_t apiThrdJoin(Loaded& l, const uint64_t* args) {
     }
 
     // runThread is driven here to keep the interpreter single-threaded internally
-    ThreadCtx* tc = nullptr;
+    ThreadContext* tc = nullptr;
     for (uint32_t i = 0; i < l.threadCount; ++i)
         if (l.threads[i].handle == handle) { tc = &l.threads[i]; break; }
     if (!tc) return 1; // thrd_error
@@ -465,3 +465,4 @@ void registerApiStandins(Loaded& l) {
 #undef GUEST_WRITE
 
 } // namespace stub
+

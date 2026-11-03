@@ -42,14 +42,10 @@ Iterations 1-5 complete (pytest 26 green, Release AND Debug):
 - Module rewrite task 3 (commit 4a15cd7): `GuestRegion` RAII VirtualAlloc/VirtualFree class (rule of 5, below-4GiB mode for x86 guests) absorbing image/stack/env/heap/thread stacks; `freeLoaded` deleted (regions free themselves); `allocLow` moved into `GuestRegion::allocate`.
 - Module rewrite task 4 (commit 2ad6d79): export_resolver split into `api_table` (ApiEntry + checked ApiTable, `add`/`find`, max 32 entries fails closed), `guest_environment` (env layout constants, TEB/PEB/Ldr/fake images, `GuestMem`/`guestMem`/`guestStr`, `buildFakeEnv`) and `api_standins` (all stand-ins + `registerApiStandins`); `GUEST_WRITE` guard macro (local, `#undef` after) replaces 4 repeated guest-copy guards; `Loaded.apis` is `ApiTable`, cores call `l.apis.find(e.ip)`.
 - Module rewrite task 5 (commit 973b1fc): `operand.hpp` (`OperandRegister`/`OperandMemory` tag structs, `Operand` = std::variant) and `instruction_decoder.hpp/.cpp` (Fetch, MR, arch-tagged `decodeMR<Architecture>` via `if constexpr` for the rm==5/mod==0 and SIB base-5 displacement asymmetries, `cond<EmuT>` + `operandRead`/`operandWrite<EmuT>` bound to the core memLd/memSt through ADL, `maskSz`/`bitsSz`/`sext`/`popcnt8` out of line). Both cores' local decode/operand machinery deleted; `Ctx.o`/`Ctx.g` are `Operand`s with `oIsReg`/`oRegIdx`/`oAddr`/`gRegIdx` helpers; `oSet`/`oVal`/`o8Read`/`o8Write` resolve the address then delegate.
+- Module rewrite task 6 (commit c63d17f): `Cpu<Architecture>` single template in `cpu.hpp`+`cpu.cpp` absorbs `vm64.cpp`+`vm86.cpp` (both deleted); every real ISA asymmetry is a compile-time `if constexpr` or an `is64` ternary, verbatim bodies kept. Lands: rep movs/stos/cmps charge the budget per iteration (`0xE0000009`), `SHELLTERP_BUDGET` env var, O(1) `ApiTable::find`; pytest `test_budget.py` pins budget 128/1 on `jmp $`, both builds. 30/30 Release+Debug.
+- Module rewrite task 7: `ThreadContext` rename, `audit.hpp/.cpp` reworked into `ExecAudit` RAII snapshot + one `verify(image, stack)` check, `main.cpp` uses it. 30/30 Release+Debug; README gains exit/fault table + design/choices.
 
 ## Part 2 — To implement
-
-Module rewrite tasks 6-7 (conventions = CONTRIBUTING.md; each task: all 4
-msbuild configs built, pytest green in Release AND Debug, one commit).
-
-- Task 6: `Cpu<Architecture>` template absorbs vm64/vm86 stepwise (a: state/run loop; b: ALU+jcc/call/ret; c: remaining opcodes; d: delete old cores). Lands: rep-string budget fix, `SHELLTERP_BUDGET` env var + budget-fault pytest pin (20-byte `jmp $` → `0xE0000009`), O(1) stand-in lookup.
-- Task 7: `ThreadContext` + RAII audit + `main` sweep; vcxproj updated, old files deleted; README exit/fault code table.
 
 Feature track after the rewrite:
 

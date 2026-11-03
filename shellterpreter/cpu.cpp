@@ -23,12 +23,13 @@ template class Cpu<Architecture::X86>;
 uint32_t run64(Loaded& l) { return Cpu<Architecture::X64>::runMain(l); }
 uint32_t run86(Loaded& l) { return Cpu<Architecture::X86>::runMain(l); }
 
-uint32_t runThread64(Loaded& l, ThreadCtx& t) { return Cpu<Architecture::X64>::runThread(l, t); }
-uint32_t runThread86(Loaded& l, ThreadCtx& t) { return Cpu<Architecture::X86>::runThread(l, t); }
+uint32_t runThread64(Loaded& l, ThreadContext& t) { return Cpu<Architecture::X64>::runThread(l, t); }
+uint32_t runThread86(Loaded& l, ThreadContext& t) { return Cpu<Architecture::X86>::runThread(l, t); }
 
-uint32_t runThread(Loaded& l, ThreadCtx& t) {
+uint32_t runThread(Loaded& l, ThreadContext& t) {
     if (l.is64) return runThread64(l, t);
     return runThread86(l, t);
 }
 
 } // namespace stub
+
