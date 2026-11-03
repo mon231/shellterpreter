@@ -79,10 +79,17 @@ inline uint64_t doNegOp(Emu& e, int sz, uint64_t a) {
 template <class T> uint8_t* addrPtr(Emu& e, uint64_t addr) {
     if (addr >= e.l->imgBase && addr + sizeof(T) <= e.imgEnd)
         return e.l->img + (addr - e.l->imgBase);
-    if (addr >= e.l->stkBase && addr + sizeof(T) <= e.stkEnd)
+    if (addr >= e.l->stkBase && addr + sizeof(T) <= e.l->stkBase + e.l->stkLen)
         return e.l->stk + (addr - e.l->stkBase);
-    if (addr >= e.envBase && addr + sizeof(T) <= e.envEnd)
+    if (addr >= e.l->envBase && addr + sizeof(T) <= e.envEnd)
         return e.l->env + (addr - e.envBase);
+    const uint64_t heapBase = reinterpret_cast<uint64_t>(e.l->heap);
+    if (heapBase && addr >= heapBase && addr + sizeof(T) <= e.l->heapEnd)
+        return e.l->heap + (addr - heapBase);
+    for (uint32_t i = 0; i < e.l->threadCount; ++i) {
+        if (addr >= e.l->threads[i].stackBase && addr + sizeof(T) <= e.l->threads[i].stackBase + e.l->threads[i].stackLen)
+            return e.l->threads[i].stack + (addr - e.l->threads[i].stackBase);
+    }
     return nullptr;
 }
 template <class T> bool memLd(Emu& e, uint64_t addr, T& out) {
@@ -1132,28 +1139,15 @@ uint32_t step(Ctx& c) {
     }
 }
 
-uint32_t run86(Loaded& l) {
-    Emu e;
-    e.l = &l;
-    e.imgEnd = l.imgBase + l.imgLen;
-    e.stkEnd = l.stkBase + l.stkLen;
-    e.fsBase = l.fsBase;
-    e.envBase = l.envBase;
-    e.envEnd = l.envBase + l.envLen;
-
-    // leave 0x100 bytes above the initial esp: stand-in interception may peek
-    // at unused vararg slots, and reads must stay inside the region
-    e.r[kRSP] = e.stkEnd - 4 - 0x100;
-    if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
-    e.ip = l.imgBase;
-
+static uint32_t runLoop(Emu& e) {
+    Loaded& l = *e.l;
     const uint64_t sentinel32 = kSentinel & 0xFFFFFFFFull;
     for (;;) {
         if (e.ip == sentinel32) break;
         if (const ApiEntry* api = lookupApi(l, e.ip)) {
             // compiled-in stand-in: stdcall, callee pops ret + args
-            uint64_t args[4] = { 0, 0, 0, 0 };
-            for (int i = 0; i < api->nargs && i < 4; ++i) {
+            uint64_t args[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            for (int i = 0; i < api->nargs && i < 8; ++i) {
                 uint32_t a = 0;
                 if (!memLd<uint32_t>(e, e.r[4] + 4 + 4 * i, a)) return FAULT_OOB;
                 args[i] = a;
@@ -1162,6 +1156,7 @@ uint32_t run86(Loaded& l) {
             if (!memLd<uint32_t>(e, e.r[4], ret)) return FAULT_OOB;
             e.r[4] += api->callerCleans ? 4 : 4 * (1 + api->nargs);
             e.r[0] = static_cast<uint32_t>(api->fn(l, args));
+            if (l.fault != FAULT_NONE) return l.fault;
             e.ip = ret;
             continue;
         }
@@ -1186,6 +1181,47 @@ uint32_t run86(Loaded& l) {
             e.ip = c.l.imgBase + f.pos;
         }
     }
+    return FAULT_NONE;
+}
+
+uint32_t run86(Loaded& l) {
+    Emu e;
+    e.l = &l;
+    e.imgEnd = l.imgBase + l.imgLen;
+    e.stkEnd = l.stkBase + l.stkLen;
+    e.fsBase = l.fsBase;
+    e.envBase = l.envBase;
+    e.envEnd = l.envBase + l.envLen;
+
+    // leave 0x100 bytes above the initial esp: stand-in interception may peek
+    // at unused vararg slots, and reads must stay inside the region
+    e.r[kRSP] = e.stkEnd - 4 - 0x100;
+    if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
+    e.ip = l.imgBase;
+
+    const uint32_t r = runLoop(e);
+    if (r != FAULT_NONE) return r;
+    return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
+}
+
+uint32_t runThread86(Loaded& l, ThreadCtx& t) {
+    Emu e;
+    e.l = &l;
+    e.imgEnd = l.imgBase + l.imgLen;
+    e.stkEnd = t.stackBase + t.stackLen;
+    e.fsBase = l.fsBase;
+    e.envBase = l.envBase;
+    e.envEnd = l.envBase + l.envLen;
+
+    // entry state of a real thread start (__stdcall): [esp] return address,
+    // [esp+4] thread argument
+    e.r[kRSP] = e.stkEnd - 4 - 0x100;
+    if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
+    if (!memSt<uint32_t>(e, e.r[kRSP] + 4, static_cast<uint32_t>(t.arg))) return FAULT_OOB;
+    e.ip = t.entry;
+
+    const uint32_t r = runLoop(e);
+    if (r != FAULT_NONE) return r;
     return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
 }
 
@@ -1193,6 +1229,10 @@ uint32_t run86(Loaded& l) {
 
 uint32_t run86(Loaded& l) {
     return x86::run86(l);
+}
+
+uint32_t runThread86(Loaded& l, ThreadCtx& t) {
+    return x86::runThread86(l, t);
 }
 
 } // namespace stub

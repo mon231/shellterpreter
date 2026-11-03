@@ -99,8 +99,9 @@ pytest tests\pytest -v
 - Keep code comments minimal (why only).
 
 ## Immediate Next Step
-Iteration 4 is complete (`03`, `04`, `09`, arch dispatch; 20 pytest green in
-Release and Debug). Start iteration 5 (CRT basics + threads), beginning with
-`08_cpp_thread`: dump its real imports, then add the thread stand-ins
-(CreateThread etc.) driven by interpreter-owned globals, and run
-`std::thread` shellcode entry points as emulated contexts.
+Iteration 5 part 1 is done: `08_cpp_thread` (`std::thread`) passes on x64 and
+x86, in Release and Debug (ledger: iteration 5a). Continue iteration 5:
+`05_dll_entry` plus remaining CRT startup pieces. Threads stay join-driven,
+single-threaded inside the interpreter; stand-ins take parameters from
+guest-stack args, with arch-specific `_Thrd_t` handling (x64 by ref, x86 by
+value) preserved in `apiThrdJoin`.

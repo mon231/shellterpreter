@@ -15,6 +15,9 @@ void freeLoaded(Loaded& l) {
     if (l.img) { VirtualFree(l.img, 0, MEM_RELEASE); l.img = nullptr; }
     if (l.stk) { VirtualFree(l.stk, 0, MEM_RELEASE); l.stk = nullptr; }
     if (l.env) { VirtualFree(l.env, 0, MEM_RELEASE); l.env = nullptr; }
+    if (l.heap) { VirtualFree(l.heap, 0, MEM_RELEASE); l.heap = nullptr; }
+    for (uint32_t i = 0; i < l.threadCount; ++i)
+        if (l.threads[i].stack) { VirtualFree(l.threads[i].stack, 0, MEM_RELEASE); l.threads[i].stack = nullptr; }
 }
 
 std::string faultMessage(uint32_t fault) {

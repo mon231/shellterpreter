@@ -41,6 +41,19 @@ struct ApiEntry {
     uint64_t (*fn)(Loaded&, const uint64_t* args);
 };
 
+// One emulated guest thread. A stand-in creates it and the join stand-in runs
+// the entry function on its own stack (see runThread).
+struct ThreadCtx {
+    uint64_t handle;
+    uint64_t entry;
+    uint64_t arg;
+    uint8_t* stack;
+    uint64_t stackBase;
+    size_t   stackLen;
+    uint32_t exitCode;
+    bool     done;
+};
+
 struct Loaded {
     uint8_t* img;
     size_t   imgLen;
@@ -53,8 +66,14 @@ struct Loaded {
     uint8_t* env;
     size_t   envLen;
     uint64_t envBase;
-    ApiEntry apis[16];
+    ApiEntry apis[32];
     uint32_t apiCount;
+    ThreadCtx threads[8];
+    uint32_t threadCount;
+    uint8_t* heap;
+    uint64_t heapNext;
+    uint64_t heapEnd;
+    uint32_t fault; // stand-in sets this to fail closed
     PeInfo   pe;
     bool     is64;
     bool     hasImage;
@@ -75,6 +94,12 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86);
 
 uint32_t run64(Loaded& l);
 uint32_t run86(Loaded& l);
+
+// Run a thread's guest entry on its own stack until it returns.
+// Semantics are join-driven: the thread runs at the first join/wait for it.
+uint32_t runThread(Loaded& l, ThreadCtx& t);
+uint32_t runThread64(Loaded& l, ThreadCtx& t);
+uint32_t runThread86(Loaded& l, ThreadCtx& t);
 
 std::string faultMessage(uint32_t fault);
 

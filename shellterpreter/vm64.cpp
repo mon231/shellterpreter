@@ -16,6 +16,8 @@ constexpr uint64_t kInstrBudget = 5000000000ull;
 
 struct Emu {
     uint64_t r[kNumReg] = {};
+    // minimal 128-bit register file for SSE data movement (movaps/movups/...)
+    uint64_t xmm[16][2] = {};
     uint64_t ip = 0;
     bool cf = false, of = false, sf = false, zf = false, pf = false, af = false, df = false;
     Loaded* l = nullptr;
@@ -79,10 +81,17 @@ inline uint64_t doNegOp(Emu& e, int sz, uint64_t a) {
 template <class T> uint8_t* addrPtr(Emu& e, uint64_t addr) {
     if (addr >= e.l->imgBase && addr + sizeof(T) <= e.imgEnd)
         return e.l->img + (addr - e.l->imgBase);
-    if (addr >= e.l->stkBase && addr + sizeof(T) <= e.stkEnd)
+    if (addr >= e.l->stkBase && addr + sizeof(T) <= e.l->stkBase + e.l->stkLen)
         return e.l->stk + (addr - e.l->stkBase);
     if (addr >= e.envBase && addr + sizeof(T) <= e.envEnd)
         return e.l->env + (addr - e.envBase);
+    const uint64_t heapBase = reinterpret_cast<uint64_t>(e.l->heap);
+    if (heapBase && addr >= heapBase && addr + sizeof(T) <= e.l->heapEnd)
+        return e.l->heap + (addr - heapBase);
+    for (uint32_t i = 0; i < e.l->threadCount; ++i) {
+        if (addr >= e.l->threads[i].stackBase && addr + sizeof(T) <= e.l->threads[i].stackBase + e.l->threads[i].stackLen)
+            return e.l->threads[i].stack + (addr - e.l->threads[i].stackBase);
+    }
     return nullptr;
 }
 template <class T> bool memLd(Emu& e, uint64_t addr, T& out) {
@@ -692,7 +701,33 @@ uint32_t step(Ctx& c) {
         return FAULT_NONE;
     }
     case 0xA4: case 0xA5:
-    case 0xAA: case 0xAB: case 0xAE:
+    case 0xAA: case 0xAB: {
+        const int szCode = (op == 0xA4 || op == 0xAA) ? 1 : (c.op66 ? 2 : (c.rexW ? 8 : 4));
+        const int step = c.e.df ? -szCode : szCode;
+        const bool mov = (op == 0xA4 || op == 0xA5);
+        if (c.rep && c.e.r[1] == 0) return FAULT_NONE;
+        for (;;) {
+            const uint64_t si = c.e.r[6], di = c.e.r[7];
+            uint64_t v = c.e.r[0] & maskSz(szCode);
+            if (mov) {
+                if (szCode == 1) { uint8_t t; if (!memLd(c.e, si, t)) return FAULT_OOB; v = t; }
+                else if (szCode == 2) { uint16_t t; if (!memLd(c.e, si, t)) return FAULT_OOB; v = t; }
+                else if (szCode == 4) { uint32_t t; if (!memLd(c.e, si, t)) return FAULT_OOB; v = t; }
+                else { uint64_t t; if (!memLd(c.e, si, t)) return FAULT_OOB; v = t; }
+                c.e.r[6] = si + static_cast<uint64_t>(step);
+            }
+            if (szCode == 1) { if (!memSt(c.e, di, static_cast<uint8_t>(v))) return FAULT_OOB; }
+            else if (szCode == 2) { if (!memSt(c.e, di, static_cast<uint16_t>(v))) return FAULT_OOB; }
+            else if (szCode == 4) { if (!memSt(c.e, di, static_cast<uint32_t>(v))) return FAULT_OOB; }
+            else { if (!memSt(c.e, di, v)) return FAULT_OOB; }
+            c.e.r[7] = di + static_cast<uint64_t>(step);
+            if (!c.rep) break;
+            --c.e.r[1];
+            if (c.e.r[1] == 0) break;
+        }
+        return FAULT_NONE;
+    }
+    case 0xAE:
         return FAULT_UNSUPPORTED;
     case 0xA6: case 0xA7: {
         const int szCode = (op == 0xA6) ? 1 : (c.op66 ? 2 : (c.rexW ? 8 : 4));
@@ -1034,6 +1069,49 @@ uint32_t step(Ctx& c) {
             if (c.fault != FAULT_NONE) return c.fault;
             return FAULT_NONE;
         }
+        case 0x10: case 0x28: case 0x6F: { // movups/movaps/movdqa xmm, xmm/mem
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            const int dst = c.g.regIdx & 15;
+            if (c.oReg) {
+                const int src = c.mr.rm | (c.rexB << 3);
+                c.e.xmm[dst][0] = c.e.xmm[src & 15][0];
+                c.e.xmm[dst][1] = c.e.xmm[src & 15][1];
+            } else {
+                const uint64_t ea = c.eaCalc();
+                uint64_t lo = 0, hi = 0;
+                if (!memLd<uint64_t>(c.e, ea, lo) || !memLd<uint64_t>(c.e, ea + 8, hi)) { c.fault = FAULT_OOB; return c.fault; }
+                c.e.xmm[dst][0] = lo;
+                c.e.xmm[dst][1] = hi;
+            }
+            return FAULT_NONE;
+        }
+        case 0x11: case 0x29: case 0x7F: { // movups/movaps/movdqa mem, xmm
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            if (c.oReg) return FAULT_UNSUPPORTED;
+            const int src = c.g.regIdx & 15;
+            const uint64_t ea = c.eaCalc();
+            if (!memSt<uint64_t>(c.e, ea, c.e.xmm[src][0]) || !memSt<uint64_t>(c.e, ea + 8, c.e.xmm[src][1])) { c.fault = FAULT_OOB; return c.fault; }
+            return FAULT_NONE;
+        }
+        case 0x57: case 0xEF: { // xorps/pxor
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            const int dst = c.g.regIdx & 15;
+            if (c.oReg) {
+                const int src = c.mr.rm | (c.rexB << 3);
+                c.e.xmm[dst][0] ^= c.e.xmm[src & 15][0];
+                c.e.xmm[dst][1] ^= c.e.xmm[src & 15][1];
+            } else {
+                const uint64_t ea = c.eaCalc();
+                uint64_t lo = 0, hi = 0;
+                if (!memLd<uint64_t>(c.e, ea, lo) || !memLd<uint64_t>(c.e, ea + 8, hi)) { c.fault = FAULT_OOB; return c.fault; }
+                c.e.xmm[dst][0] ^= lo;
+                c.e.xmm[dst][1] ^= hi;
+            }
+            return FAULT_NONE;
+        }
         case 0x0B: return FAULT_UNSUPPORTED;
         case 0x05: case 0x34: case 0x35:
             return FAULT_UNSUPPORTED;
@@ -1121,22 +1199,8 @@ uint32_t step(Ctx& c) {
     }
 }
 
-uint32_t run64(Loaded& l) {
-    Emu e;
-    e.l = &l;
-    e.imgEnd = l.imgBase + l.imgLen;
-    e.stkEnd = l.stkBase + l.stkLen;
-    e.fsBase = l.fsBase;
-    e.gsBase = l.gsBase;
-    e.envBase = l.envBase;
-    e.envEnd = l.envBase + l.envLen;
-
-    // leave 0x100 bytes above the initial rsp: stand-in interception may peek
-    // at unused vararg slots, and reads must stay inside the region
-    e.r[kRSP] = e.stkEnd - 8 - 0x100;
-    if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return FAULT_OOB;
-    e.ip = l.imgBase;
-
+static uint32_t runLoop(Emu& e) {
+    Loaded& l = *e.l;
     for (;;) {
         if (e.ip == kSentinel) break;
         if (const ApiEntry* api = lookupApi(l, e.ip)) {
@@ -1150,6 +1214,7 @@ uint32_t run64(Loaded& l) {
                     return FAULT_OOB;
             }
             e.r[0] = api->fn(l, args);
+            if (l.fault != FAULT_NONE) return l.fault;
             e.ip = ret;
             continue;
         }
@@ -1180,6 +1245,49 @@ uint32_t run64(Loaded& l) {
             e.ip = c.l.imgBase + f.pos;
         }
     }
+    return FAULT_NONE;
+}
+
+uint32_t run64(Loaded& l) {
+    Emu e;
+    e.l = &l;
+    e.imgEnd = l.imgBase + l.imgLen;
+    e.stkEnd = l.stkBase + l.stkLen;
+    e.fsBase = l.fsBase;
+    e.gsBase = l.gsBase;
+    e.envBase = l.envBase;
+    e.envEnd = l.envBase + l.envLen;
+
+    // leave 0x100 bytes above the initial rsp: stand-in interception may peek
+    // at unused vararg slots, and reads must stay inside the region
+    e.r[kRSP] = e.stkEnd - 8 - 0x100;
+    if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return FAULT_OOB;
+    e.ip = l.imgBase;
+
+    const uint32_t r = runLoop(e);
+    if (r != FAULT_NONE) return r;
+    return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
+}
+
+uint32_t runThread64(Loaded& l, ThreadCtx& t) {
+    Emu e;
+    e.l = &l;
+    e.imgEnd = l.imgBase + l.imgLen;
+    e.stkEnd = t.stackBase + t.stackLen;
+    e.fsBase = l.fsBase;
+    e.gsBase = l.gsBase;
+    e.envBase = l.envBase;
+    e.envEnd = l.envBase + l.envLen;
+
+    // entry state of a real thread start: sentinel return address on top,
+    // thread argument in the first argument register
+    e.r[kRSP] = e.stkEnd - 8 - 0x100;
+    if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return FAULT_OOB;
+    e.r[1] = t.arg;
+    e.ip = t.entry;
+
+    const uint32_t r = runLoop(e);
+    if (r != FAULT_NONE) return r;
     return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
 }
 
@@ -1187,6 +1295,15 @@ uint32_t run64(Loaded& l) {
 
 uint32_t run64(Loaded& l) {
     return x64::run64(l);
+}
+
+uint32_t runThread64(Loaded& l, ThreadCtx& t) {
+    return x64::runThread64(l, t);
+}
+
+uint32_t runThread(Loaded& l, ThreadCtx& t) {
+    if (l.is64) return runThread64(l, t);
+    return runThread86(l, t);
 }
 
 } // namespace stub

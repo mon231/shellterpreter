@@ -16,6 +16,12 @@ namespace stub {
 //   0x1010 RtlAdd* stand-in               0x1C00 MessageBoxA stand-in
 //   0x1D00 printf stand-in                0x1D10 srand stand-in
 //   0x1D20 rand stand-in                  0x1E00 fake msvcrt module handle (no image)
+//   0x1D30 FindResourceA stand-in         0x1D40 SizeofResource stand-in
+//   0x1D50 _beginthreadex stand-in        0x1D60 _Thrd_join stand-in
+//   0x1D70 _Thrd_id stand-in              0x1D80 _Cnd_do_broadcast_at_thread_exit
+//   0x1D90 malloc stand-in                0x1DA0 free stand-in
+//   0x1DB0 _callnewh stand-in             0x1DC0 fail-closed CRT helper
+//   0x1F00 fake CRT/MSVC module handle (ucrt/msvcp/vcruntime/api-set, no image)
 //   0x1800 fake user32 module handle (no image; GetProcAddress never walks it)
 namespace {
 constexpr uint32_t K32_RVA    = 0x800;
@@ -30,7 +36,16 @@ constexpr uint32_t ST_SRAND_A  = 0x1D10;
 constexpr uint32_t ST_RAND_A   = 0x1D20;
 constexpr uint32_t ST_FIND_RES_A = 0x1D30;
 constexpr uint32_t ST_SIZE_RES_A = 0x1D40;
+constexpr uint32_t ST_BEGINT   = 0x1D50;
+constexpr uint32_t ST_THRDJOIN = 0x1D60;
+constexpr uint32_t ST_THRDID   = 0x1D70;
+constexpr uint32_t ST_CNDEXIT  = 0x1D80;
+constexpr uint32_t ST_MALLOC   = 0x1D90;
+constexpr uint32_t ST_FREE     = 0x1DA0;
+constexpr uint32_t ST_CALLNEWH = 0x1DB0;
+constexpr uint32_t ST_CRTFAIL  = 0x1DC0;
 constexpr uint32_t MSVCRT_RVA  = 0x1E00;
+constexpr uint32_t CRTRT_RVA   = 0x1F00;
 }
 
 void* allocLow(size_t sz) {
@@ -43,23 +58,37 @@ void* allocLow(size_t sz) {
     return VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
-// Guest string read: shellcode data may live in the image, stack or env; the
-// first NUL ends the name. Returns false if addr is outside guest memory.
-static bool guestStr(const Loaded& l, uint64_t addr, char out[64]) {
-    uint64_t lo = 0, hi = 0;
-    const uint8_t* src = nullptr;
-    if (addr >= l.imgBase && addr < l.imgBase + l.imgLen) {
-        src = l.img + (addr - l.imgBase); lo = l.imgBase; hi = l.imgBase + l.imgLen;
-    } else if (addr >= l.envBase && addr < l.envBase + l.envLen) {
-        src = l.env + (addr - l.envBase); lo = l.envBase; hi = l.envBase + l.envLen;
-    } else if (addr >= l.stkBase && addr < l.stkBase + l.stkLen) {
-        src = l.stk + (addr - l.stkBase); lo = l.stkBase; hi = l.stkBase + l.stkLen;
-    } else {
-        return false;
+// Guest memory view over any mapped guest region (image, stack, env, heap and
+// each thread's own stack). Returns a host pointer and the bytes remaining
+// from addr to the end of that region; null if addr is outside guest memory.
+struct GuestMem { uint8_t* p; size_t avail; };
+static GuestMem guestMem(const Loaded& l, uint64_t addr) {
+    auto hit = [](uint8_t* base, uint64_t b, size_t len,
+                  uint64_t a, size_t n) -> GuestMem {
+        if (!base || a < b || a - b >= len) return { nullptr, 0 };
+        const size_t off = static_cast<size_t>(a - b);
+        if (off + n > len) return { nullptr, 0 };
+        return { base + off, len - off };
+    };
+    if (auto m = hit(l.img, l.imgBase, l.imgLen, addr, 1); m.p) return m;
+    if (auto m = hit(l.stk, l.stkBase, l.stkLen, addr, 1); m.p) return m;
+    if (auto m = hit(l.env, l.envBase, l.envLen, addr, 1); m.p) return m;
+    const uint64_t heapBase = reinterpret_cast<uint64_t>(l.heap);
+    const size_t heapLen = static_cast<size_t>(l.heapEnd - heapBase);
+    if (auto m = hit(l.heap, heapBase, heapLen, addr, 1); m.p) return m;
+    for (uint32_t i = 0; i < l.threadCount; ++i) {
+        if (auto m = hit(l.threads[i].stack, l.threads[i].stackBase,
+                         l.threads[i].stackLen, addr, 1); m.p) return m;
     }
+    return { nullptr, 0 };
+}
+
+static bool guestStr(const Loaded& l, uint64_t addr, char out[64]) {
+    GuestMem m = guestMem(l, addr);
+    if (!m.p) return false;
     size_t n = 0;
-    while (n < 63 && (addr + n) < hi) {
-        const char c = static_cast<char>(src[n]);
+    while (n < 63 && n < m.avail) {
+        const char c = static_cast<char>(m.p[n]);
         out[n] = c;
         if (c == '\0') return true;
         ++n;
@@ -83,6 +112,12 @@ static bool nameEq(const char* a, const char* b) {
 // ordinal; name pointers are absolute and >= imgBase (>= 0x10000 by allocLow)
 static const uint64_t kOrdinalMax = 0x10000ull;
 
+static bool startsWithNoCase(const char* s, const char* prefix) {
+    for (; *prefix; ++s, ++prefix)
+        if (lowerAscii(*s) != lowerAscii(*prefix)) return false;
+    return true;
+}
+
 static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
     char name[64];
     if (!guestStr(l, args[0], name)) return 0;
@@ -91,6 +126,14 @@ static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
     }
     if (nameEq(name, "user32.dll")) return l.envBase + USER32_RVA;
     if (nameEq(name, "msvcrt.dll")) return l.envBase + MSVCRT_RVA;
+    // the CRT is split over ucrtbase/msvcp140/vcruntime140 and api-set stubs,
+    // with a "d" suffix in Debug builds (msvcp140d, ucrtbased, ...)
+    if (startsWithNoCase(name, "ucrtbase") || startsWithNoCase(name, "ucrtbased") ||
+        startsWithNoCase(name, "msvcp140") ||
+        startsWithNoCase(name, "vcruntime140") ||
+        startsWithNoCase(name, "api-ms-win-crt-")) {
+        return l.envBase + CRTRT_RVA;
+    }
     return 0;
 }
 
@@ -106,6 +149,21 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "rand"))          return l.envBase + ST_RAND_A;
     if (nameEq(name, "FindResourceA")) return l.envBase + ST_FIND_RES_A;
     if (nameEq(name, "SizeofResource")) return l.envBase + ST_SIZE_RES_A;
+    if (nameEq(name, "_beginthreadex")) return l.envBase + ST_BEGINT;
+    if (nameEq(name, "_Thrd_join"))     return l.envBase + ST_THRDJOIN;
+    if (nameEq(name, "_Thrd_id"))       return l.envBase + ST_THRDID;
+    if (nameEq(name, "GetCurrentThreadId")) return l.envBase + ST_THRDID;
+    if (nameEq(name, "_Cnd_do_broadcast_at_thread_exit")) return l.envBase + ST_CNDEXIT;
+    if (nameEq(name, "malloc"))         return l.envBase + ST_MALLOC;
+    if (nameEq(name, "free"))           return l.envBase + ST_FREE;
+    if (nameEq(name, "_callnewh"))      return l.envBase + ST_CALLNEWH;
+    // throw helpers are resolved but only a guest raising an exception reaches
+    // them; that is not emulated yet, so they fail closed instead of returning
+    if (nameEq(name, "_CxxThrowException")) return l.envBase + ST_CRTFAIL;
+    if (nameEq(name, "__std_exception_copy")) return l.envBase + ST_CRTFAIL;
+    if (nameEq(name, "__std_exception_destroy")) return l.envBase + ST_CRTFAIL;
+    if (nameEq(name, "?_Throw_Cpp_error@std@@YAXH@Z")) return l.envBase + ST_CRTFAIL;
+    if (nameEq(name, "terminate")) return l.envBase + ST_CRTFAIL;
     return 0;
 }
 
@@ -277,6 +335,97 @@ static uint64_t apiSizeofResource(Loaded& l, const uint64_t* args) {
     return size;
 }
 
+static uint64_t apiBeginThread(Loaded& l, const uint64_t* args) {
+    // _beginthreadex(security, stackSize, start, arglist, initflag, thrdaddr).
+    // The thread is not run here: runThread is triggered by the first join or
+    // wait for it, which keeps the interpreter single-threaded internally.
+    if (l.threadCount >= 8) return 0;
+    size_t stackSize = static_cast<size_t>(args[1]);
+    if (stackSize < 0x4000) stackSize = 0x40000; // default-ish, generous
+    if (stackSize > 0x400000) stackSize = 0x400000;
+    void* stk = allocLow(stackSize);
+    if (!stk) return 0;
+    ThreadCtx& t = l.threads[l.threadCount];
+    t = ThreadCtx{};
+    t.handle = 0x400ull + l.threadCount;
+    t.entry = args[2];
+    t.arg = args[3];
+    t.stack = static_cast<uint8_t*>(stk);
+    t.stackBase = reinterpret_cast<uint64_t>(stk);
+    t.stackLen = stackSize;
+    t.done = false;
+    t.exitCode = 0;
+    ++l.threadCount;
+    if (args[5]) {
+        uint32_t id = static_cast<uint32_t>(t.handle);
+        GuestMem m = guestMem(l, args[5]);
+        if (m.p && m.avail >= 4) memcpy(m.p, &id, 4);
+    }
+    return t.handle;
+}
+
+static uint64_t apiThrdJoin(Loaded& l, const uint64_t* args) {
+    // _Thrd_join(_Thrd_t thr, int* code). _Thrd_t differs per arch: x64 passes a
+    // pointer to {Hnd,Id}, x86 passes the 8-byte struct by value on the stack.
+    uint64_t handle = args[0];
+    uint64_t codePtr = args[1];
+    if (l.is64) {
+        uint32_t hnd = 0;
+        GuestMem m = guestMem(l, args[0]);
+        if (m.p && m.avail >= sizeof(void*)) {
+            if (sizeof(void*) == 4) memcpy(&hnd, m.p, 4);
+            else { uint64_t h64 = 0; memcpy(&h64, m.p, 8); hnd = static_cast<uint32_t>(h64); }
+        }
+        handle = hnd;
+    } else {
+        codePtr = args[2];
+    }
+
+    // runThread is driven here to keep the interpreter single-threaded internally
+    ThreadCtx* tc = nullptr;
+    for (uint32_t i = 0; i < l.threadCount; ++i)
+        if (l.threads[i].handle == handle) { tc = &l.threads[i]; break; }
+    if (!tc) return 1; // thrd_error
+    if (!tc->done) {
+        const uint32_t rc = runThread(l, *tc);
+        tc->exitCode = rc;
+        tc->done = true;
+    }
+    if (codePtr) {
+        uint32_t code = tc->exitCode;
+        GuestMem m = guestMem(l, codePtr);
+        if (m.p && m.avail >= 4) memcpy(m.p, &code, 4);
+    }
+    return 0; // thrd_success
+}
+
+static uint64_t apiThrdId(Loaded&, const uint64_t*) {
+    return 1; // main thread id
+}
+
+static uint64_t apiCndExit(Loaded&, const uint64_t*) { return 0; }
+
+static uint64_t apiMalloc(Loaded& l, const uint64_t* args) {
+    const size_t sz = static_cast<size_t>(args[0]);
+    if (!sz) return 0;
+    const uint64_t align = 16;
+    const uint64_t base = l.heapNext;
+    const uint64_t aligned = (base + align - 1) & ~(align - 1);
+    const uint64_t end = aligned + sz;
+    if (end > l.heapEnd) return 0;
+    l.heapNext = end;
+    return aligned;
+}
+
+static uint64_t apiFree(Loaded&, const uint64_t*) { return 0; }
+
+static uint64_t apiCallNewh(Loaded&, const uint64_t*) { return 0; } // no new-handler
+
+static uint64_t apiCrtFail(Loaded& l, const uint64_t*) {
+    l.fault = FAULT_UNSUPPORTED;
+    return 0;
+}
+
 uint32_t buildFakeEnv(Loaded& l) {
     constexpr size_t kEnv = 0x2000;
     void* p = allocLow(kEnv);
@@ -290,6 +439,16 @@ uint32_t buildFakeEnv(Loaded& l) {
     const uint32_t B = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m));
     l.fsBase = l.envBase + 0x100;
     l.gsBase = l.envBase + 0x100;
+
+    // guest heap: bump allocator for std::thread's operator new (malloc) and
+    // any other dynamic allocation; freed only on process exit
+    void* hp = allocLow(0x100000);
+    if (!hp) return FAULT_ALLOC;
+    l.heap = static_cast<uint8_t*>(hp);
+    l.heapNext = reinterpret_cast<uint64_t>(hp);
+    l.heapEnd = l.heapNext + 0x100000;
+    l.threadCount = 0;
+    l.fault = FAULT_NONE;
 
     // module chain: head -> ntdll (node2) -> kernel32 (node3)
     put32(0x400, B + 0x500);
@@ -356,6 +515,14 @@ uint32_t buildFakeEnv(Loaded& l) {
         { B + ST_RAND_A, 0, true, apiRand },
         { B + ST_FIND_RES_A, 3, false, apiFindResourceA },
         { B + ST_SIZE_RES_A, 2, false, apiSizeofResource },
+        { B + ST_BEGINT,   6, true, apiBeginThread },
+        { B + ST_THRDJOIN, 3, true, apiThrdJoin },
+        { B + ST_THRDID,   0, true, apiThrdId },
+        { B + ST_CNDEXIT,  0, true, apiCndExit },
+        { B + ST_MALLOC,   1, true, apiMalloc },
+        { B + ST_FREE,     1, true, apiFree },
+        { B + ST_CALLNEWH, 1, true, apiCallNewh },
+        { B + ST_CRTFAIL,  2, true, apiCrtFail },
     };
     l.apiCount = static_cast<uint32_t>(sizeof(apis) / sizeof(apis[0]));
     memcpy(l.apis, apis, sizeof(apis));
