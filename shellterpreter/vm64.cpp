@@ -31,6 +31,7 @@ inline unsigned popcnt8(uint8_t v) {
     while (v) { n += v & 1; v >>= 1; }
     return n;
 }
+
 constexpr uint64_t kWmask[9] = { 0, 0xFF, 0xFFFF, 0, 0xFFFFFFFFull, 0, 0, 0, ~0ull };
 constexpr unsigned kWbits[9] = { 0, 8, 16, 0, 32, 0, 0, 0, 64 };
 inline uint64_t maskSz(int sz) { return kWmask[sz]; }
@@ -43,6 +44,7 @@ inline void flagsLogic(Emu& e, int sz, uint64_t res) {
     e.sf = (res & (1ull << (bitsSz(sz) - 1))) != 0;
     e.pf = (popcnt8(static_cast<uint8_t>(res & 0xFF)) % 2) == 0;
 }
+
 inline uint64_t doAdd(Emu& e, int sz, uint64_t a, uint64_t b) {
     const uint64_t sum = (a & maskSz(sz)) + (b & maskSz(sz));
     const uint64_t res = sum & maskSz(sz);
@@ -295,7 +297,12 @@ struct Ctx {
         case 1: { const uint8_t v = f.u8(); return signImm8 ? sext(1, v) : v; }
         case 2: { const uint16_t v = f.u16(); return v; }
         case 4: { const uint32_t v = f.u32(); return v; }
-        case 8: { const uint32_t v = f.u32(); return signImm8 ? sext(4, v) : v; }
+        case 8: {
+            if (signImm8) { const uint32_t v = f.u32(); return sext(4, v); }
+            const uint32_t lo = f.u32();
+            const uint32_t hi = f.u32();
+            return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+        }
         }
         fault = FAULT_UNSUPPORTED; return 0;
     }
@@ -432,6 +439,7 @@ uint32_t stepOne(Ctx& c) {
         case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x64:
             ++f.pos; continue;
         case 0xF3: c.rep = true; ++f.pos; continue;
+        case 0xF0: ++f.pos; continue; // lock: single-threaded, nothing to lock
         default:
             return step(c);
         }
@@ -904,7 +912,7 @@ uint32_t step(Ctx& c) {
         c.e.ip = take ? nxt + static_cast<uint64_t>(rel) : nxt;
         return FAULT_NONE;
     }
-    case 0xF4: return FAULT_HALT;
+    case 0xF4: return FAULT_HALT; // see runLoop: hlt ends the stub chain, exit = EAX
     case 0xF5: c.e.cf = !c.e.cf; return FAULT_NONE;
     case 0xF8: c.e.cf = false; return FAULT_NONE;
     case 0xF9: c.e.cf = true;  return FAULT_NONE;
@@ -1113,6 +1121,18 @@ uint32_t step(Ctx& c) {
             return FAULT_NONE;
         }
         case 0x0B: return FAULT_UNSUPPORTED;
+        case 0xA2: { // CPUID: Intel vendor; leaves past 1 report no features so
+                     // the CRT runtime dispatch settles on plain SSE2
+            const uint64_t leaf = c.e.r[2];
+            if (leaf == 0)
+                c.e.r[0] = 1, c.e.r[3] = 0x756E6547,
+                c.e.r[1] = 0x49656E69, c.e.r[2] = 0x6C65746E;
+            else if (leaf == 1)
+                c.e.r[0] = 0x633, c.e.r[3] = 1u << 26, c.e.r[2] = 0, c.e.r[1] = 0;
+            else
+                c.e.r[0] = c.e.r[1] = c.e.r[2] = c.e.r[3] = 0;
+            return FAULT_NONE;
+        }
         case 0x05: case 0x34: case 0x35:
             return FAULT_UNSUPPORTED;
         case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
@@ -1156,6 +1176,45 @@ uint32_t step(Ctx& c) {
             const uint64_t res = static_cast<uint64_t>(prod) & maskSz(sz);
             c.e.cf = c.e.of = ovf != 0;
             c.gSet(sz, res);
+            if (c.fault != FAULT_NONE) return c.fault;
+            return FAULT_NONE;
+        }
+        case 0xA3: case 0xAB: case 0xB3: case 0xBB:
+        case 0xBA: { // bt/bts/btr/btc r/m, r64 or imm8
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            int kind;
+            if (op2 == 0xBA) {
+                const int r = c.mr.reg & 7;
+                if (r < 4) return FAULT_UNSUPPORTED;
+                kind = r - 4;
+            } else kind = (op2 == 0xA3) ? 0 : (op2 == 0xAB) ? 1 : (op2 == 0xB3) ? 2 : 3;
+            const uint64_t base = c.oVal(sz);
+            if (c.fault != FAULT_NONE) return c.fault;
+            const uint64_t bit = (op2 == 0xBA ? f.u8() : c.gVal(sz)) % (static_cast<uint64_t>(sz) * 8);
+            const uint64_t mask = 1ull << bit;
+            c.e.cf = (base & mask) != 0;
+            if (kind == 1) c.oSet(sz, base | mask);
+            else if (kind == 2) c.oSet(sz, base & ~mask);
+            else if (kind == 3) c.oSet(sz, base ^ mask);
+            if (c.fault != FAULT_NONE) return c.fault;
+            return FAULT_NONE;
+        }
+        case 0xB0: case 0xB1: { // cmpxchg r/m, r: single-threaded, lock is a no-op
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            const int osz = (op2 == 0xB1) ? sz : 1;
+            const uint64_t dst = c.oVal(osz);
+            if (c.fault != FAULT_NONE) return c.fault;
+            const uint64_t src = c.gVal(osz);
+            const uint64_t acc = c.e.r[0] & maskSz(osz);
+            if (dst == acc) {
+                c.e.zf = true;
+                c.oSet(osz, src);
+            } else {
+                c.e.zf = false;
+                c.e.r[0] = (c.e.r[0] & ~maskSz(osz)) | dst;
+            }
             if (c.fault != FAULT_NONE) return c.fault;
             return FAULT_NONE;
         }
@@ -1230,11 +1289,7 @@ static uint32_t runLoop(Emu& e) {
         Ctx c{e, l, f, e.ip};
         const uint32_t r = stepOne(c);
         if (r != FAULT_NONE) {
-            fprintf(stderr, "fault ipoff=0x%llX r0=%llX rcx=%llX rsp=%llX rsi=%llX rdi=%llX rbx=%llX\n",
-                    (unsigned long long)(e.ip - l.imgBase), (unsigned long long)e.r[0],
-                    (unsigned long long)e.r[1], (unsigned long long)e.r[4],
-                    (unsigned long long)e.r[6], (unsigned long long)e.r[7],
-                    (unsigned long long)e.r[3]);
+            if (r == FAULT_HALT) break; // stub chain end: exit code = EAX (run64)
             if (r == FAULT_OOB) {
                 fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX\n",
                         static_cast<unsigned long long>(e.ip));
@@ -1263,9 +1318,16 @@ uint32_t run64(Loaded& l) {
     e.r[kRSP] = e.stkEnd - 8 - 0x100;
     if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return FAULT_OOB;
     e.ip = l.imgBase;
+    if (l.pe.isDll) {
+        // DLL entry signature: DllMain(hinst, DLL_PROCESS_ATTACH, nullptr);
+        // hinst = guest address of the image's PE header
+        e.r[1] = l.imgBase + l.pe.imageOffset;
+        e.r[2] = 1;
+        e.r[3] = 0;
+    }
 
     const uint32_t r = runLoop(e);
-    if (r != FAULT_NONE) return r;
+    if (r != FAULT_NONE && r != FAULT_HALT) return r;
     return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
 }
 

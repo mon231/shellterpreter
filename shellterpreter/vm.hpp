@@ -26,6 +26,7 @@ struct PeInfo {
     uint32_t entryRva;
     uint32_t imageBase;
     uint32_t sizeOfImage;
+    bool     isDll; // IMAGE_FILE_DLL: entry gets DllMain args
 };
 
 // Native stand-in registered by the loader. nargs counts the call-site

@@ -44,6 +44,21 @@ constexpr uint32_t ST_MALLOC   = 0x1D90;
 constexpr uint32_t ST_FREE     = 0x1DA0;
 constexpr uint32_t ST_CALLNEWH = 0x1DB0;
 constexpr uint32_t ST_CRTFAIL  = 0x1DC0;
+constexpr uint32_t ST_CSH      = 0x1DD0; // __C_specific_handler stub
+constexpr uint32_t ST_MEMCPY   = 0x1DE0;
+constexpr uint32_t ST_CNOP     = 0x1DF0; // shared cdecl no-op (uCRT startup)
+constexpr uint32_t ST_MEMSET   = 0x1DF8;
+constexpr uint32_t ST_GCURPROC = 0x1E00; // GetCurrentProcess
+constexpr uint32_t ST_TERMPROC = 0x1E08; // TerminateProcess
+constexpr uint32_t ST_EH4      = 0x1E10; // _except_handler4_common
+// kernel32 slack (no export data below 0x1000): CRT-startup API stand-ins
+constexpr uint32_t ST_GSFT   = 0xC00; // GetSystemTimeAsFileTime
+constexpr uint32_t ST_QPC    = 0xC10; // QueryPerformanceCounter
+constexpr uint32_t ST_PID    = 0xC20; // GetCurrentProcessId
+constexpr uint32_t ST_SLIST  = 0xC30; // InitializeSListHead
+constexpr uint32_t ST_UEHF   = 0xC40; // UnhandledExceptionFilter
+constexpr uint32_t ST_SUEH   = 0xC50; // SetUnhandledExceptionFilter
+constexpr uint32_t ST_IPP    = 0xC60; // IsProcessorFeaturePresent
 constexpr uint32_t MSVCRT_RVA  = 0x1E00;
 constexpr uint32_t CRTRT_RVA   = 0x1F00;
 }
@@ -164,12 +179,101 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "__std_exception_destroy")) return l.envBase + ST_CRTFAIL;
     if (nameEq(name, "?_Throw_Cpp_error@std@@YAXH@Z")) return l.envBase + ST_CRTFAIL;
     if (nameEq(name, "terminate")) return l.envBase + ST_CRTFAIL;
+    if (nameEq(name, "GetSystemTimeAsFileTime")) return l.envBase + ST_GSFT;
+    if (nameEq(name, "QueryPerformanceCounter")) return l.envBase + ST_QPC;
+    if (nameEq(name, "GetCurrentProcessId")) return l.envBase + ST_PID;
+    if (nameEq(name, "InitializeSListHead")) return l.envBase + ST_SLIST;
+    if (nameEq(name, "UnhandledExceptionFilter")) return l.envBase + ST_UEHF;
+    if (nameEq(name, "SetUnhandledExceptionFilter")) return l.envBase + ST_SUEH;
+    if (nameEq(name, "IsProcessorFeaturePresent")) return l.envBase + ST_IPP;
+    // CRT startup pieces: iterations ran without them so far because the peor
+    // stub chain takes EXE tests straight to main; a DLL entry runs the real
+    // _DllMainCRTStartup flow and needs these
+    if (nameEq(name, "__C_specific_handler")) return l.envBase + ST_CSH;
+    if (nameEq(name, "GetCurrentProcess")) return l.envBase + ST_GCURPROC;
+    // never legitimate mid-run: fail closed
+    if (nameEq(name, "TerminateProcess")) return l.envBase + ST_TERMPROC;
+    if (nameEq(name, "_except_handler4_common")) return l.envBase + ST_EH4;
+    if (nameEq(name, "memcpy")) return l.envBase + ST_MEMCPY;
+    if (nameEq(name, "memset")) return l.envBase + ST_MEMSET;
+    if (nameEq(name, "_cexit") ||
+        nameEq(name, "_execute_onexit_table") ||
+        nameEq(name, "_initialize_onexit_table") ||
+        nameEq(name, "_initialize_narrow_environment") ||
+        nameEq(name, "_configure_narrow_argv") ||
+        nameEq(name, "_seh_filter_dll") ||
+        nameEq(name, "__std_type_info_destroy_list") ||
+        nameEq(name, "IsDebuggerPresent") ||
+        // shortcut: _initterm/_initterm_e skip the paste tables; a test with
+        // real C++ static initializers (ctors in __xc_a) will need a run-loop
+        // driven version, upgrade in iteration 6 alongside exception tests
+        nameEq(name, "_initterm") ||
+        nameEq(name, "_initterm_e")) return l.envBase + ST_CNOP;
+    // Rtl unwind/context never legitimately run before exception support;
+    // fail closed instead of silently returning zeros
+    if (nameEq(name, "RtlCaptureContext") ||
+        nameEq(name, "RtlLookupFunctionEntry") ||
+        nameEq(name, "RtlVirtualUnwind")) return l.envBase + ST_CRTFAIL;
     return 0;
 }
 
 static uint64_t apiMessageBoxA(Loaded&, const uint64_t*) { return 1; } // IDOK
 
 static uint64_t apiRtlAdd(Loaded&, const uint64_t*) { return 1; } // handler registered
+
+// CRT-startup time/counter stand-ins: deterministic zeros, so the GS cookie
+// and any counters the guest mixes stay stable
+static uint64_t apiGetSystemTimeAsFileTime(Loaded& l, const uint64_t* args) {
+    const uint64_t zero = 0;
+    GuestMem m = guestMem(l, args[0]);
+    if (m.p && m.avail >= 8) memcpy(m.p, &zero, 8);
+    return 0; // void
+}
+
+static uint64_t apiQueryPerformanceCounter(Loaded& l, const uint64_t* args) {
+    const uint64_t zero = 0;
+    GuestMem m = guestMem(l, args[0]);
+    if (m.p && m.avail >= 8) memcpy(m.p, &zero, 8);
+    return 1;
+}
+
+static uint64_t apiGetCurrentProcessId(Loaded&, const uint64_t*) { return 1; }
+
+    static uint64_t apiNoOp(Loaded&, const uint64_t*) { return 0; }
+
+// __C_specific_handler: real SEH comes with iteration 6; the startup flow
+// only needs a truthful "no exception happened" oracle here
+static uint64_t apiCsh(Loaded&, const uint64_t*) { return 0; }
+
+// CRT memcpy/memset through the guest address space: the uCRT DLL startup
+// copies cookie/init data through these
+static uint64_t apiMemcpy(Loaded& l, const uint64_t* args) {
+    const size_t n = static_cast<size_t>(args[2]);
+    if (!n) return args[0];
+    GuestMem dst = guestMem(l, args[0]);
+    GuestMem src = guestMem(l, args[1]);
+    if (!dst.p || dst.avail < n || !src.p || src.avail < n) {
+        l.fault = FAULT_OOB;
+        return 0;
+    }
+    memmove(dst.p, src.p, n);
+    return args[0];
+}
+
+static uint64_t apiMemset(Loaded& l, const uint64_t* args) {
+    const size_t n = static_cast<size_t>(args[2]);
+    if (!n) return args[0];
+    GuestMem dst = guestMem(l, args[0]);
+    if (!dst.p || dst.avail < n) {
+        l.fault = FAULT_OOB;
+        return 0;
+    }
+    memset(dst.p, static_cast<int>(args[1] & 0xFF), n);
+    return args[0];
+}
+
+// pseudo process handle, (HANDLE)-1
+static uint64_t apiGetCurrentProcess(Loaded&, const uint64_t*) { return 0xFFFFFFFFFFFFFFFFull; }
 
 // rand/srand: classic MSVCRT LCG, shared static seed
 namespace {
@@ -494,11 +598,13 @@ uint32_t buildFakeEnv(Loaded& l) {
     put16(0x1248, 0);                       // ordinal[0]
     put32(0x1250, 0x280);                   // names[0] RVA
     if (l.is64) {
+        put32(0x130, B + 0x100);            // TEB+0x30 = TEB Self (x64 gs:[0x30])
         put32(0x160, B + 0x200);            // TEB+0x60 = PEB (x64 peb walk at gs:[0x60])
         put32(0x218, B + 0x300);            // PEB+0x18 = Ldr
         put32(0x320, B + 0x400);            // Ldr+0x20 = InMemoryOrderModuleList.Flink
         memcpy(m + 0x1280, "RtlAddFunctionTable", 20);
     } else {
+        put32(0x118, B + 0x100);            // TEB+0x18 = TEB Self (x86 fs:[0x18])
         put32(0x130, B + 0x200);            // TEB+0x30 = PEB (x86 fs:[0x30])
         put32(0x20C, B + 0x300);            // PEB+0x0C = Ldr (absolute)
         put32(0x314, B + 0x400);            // Ldr+0x14 = InMemoryOrderModuleList.Flink
@@ -523,6 +629,20 @@ uint32_t buildFakeEnv(Loaded& l) {
         { B + ST_FREE,     1, true, apiFree },
         { B + ST_CALLNEWH, 1, true, apiCallNewh },
         { B + ST_CRTFAIL,  2, true, apiCrtFail },
+        { B + ST_GSFT,     1, false, apiGetSystemTimeAsFileTime },
+        { B + ST_QPC,      1, false, apiQueryPerformanceCounter },
+        { B + ST_PID,      0, false, apiGetCurrentProcessId },
+        { B + ST_SLIST,    1, false, apiNoOp },
+        { B + ST_UEHF,     1, false, apiNoOp },
+        { B + ST_SUEH,     1, false, apiNoOp },
+        { B + ST_IPP,      1, false, apiNoOp },
+        { B + ST_CSH,      4, true,  apiCsh },
+        { B + ST_MEMCPY,   3, true,  apiMemcpy },
+        { B + ST_CNOP,     0, true,  apiNoOp },
+        { B + ST_MEMSET,   3, true,  apiMemset },
+        { B + ST_GCURPROC, 1, false, apiGetCurrentProcess },
+        { B + ST_TERMPROC, 2, false, apiCrtFail },
+        { B + ST_EH4,      4, false, apiCsh },
     };
     l.apiCount = static_cast<uint32_t>(sizeof(apis) / sizeof(apis[0]));
     memcpy(l.apis, apis, sizeof(apis));

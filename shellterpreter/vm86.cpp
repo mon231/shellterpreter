@@ -22,6 +22,7 @@ struct Emu {
     uint64_t imgEnd = 0, stkEnd = 0;
     uint64_t fsBase = 0, envBase = 0, envEnd = 0;
     uint64_t budget = kInstrBudget;
+    uint64_t xmm[8][2] = {}; // SSE regs: only movlpd/xorps data flow the CRT uses
 };
 
 inline unsigned popcnt8(uint8_t v) {
@@ -396,6 +397,7 @@ uint32_t stepOne(Ctx& c) {
         case 0x67: ++f.pos; continue;
         case 0x64: c.segFs = 1; ++f.pos; continue;
         case 0xF3: c.rep = true; ++f.pos; continue;
+        case 0xF0: ++f.pos; continue; // lock: single-threaded, nothing to lock
         case 0x2E: case 0x3E: case 0x26: case 0x36: case 0x65:
             ++f.pos;
             continue;
@@ -850,7 +852,7 @@ uint32_t step(Ctx& c) {
         c.e.ip = take ? nxt + static_cast<uint64_t>(rel) : nxt;
         return FAULT_NONE;
     }
-    case 0xF4: return FAULT_HALT;
+    case 0xF4: return FAULT_HALT; // see run86: hlt ends the stub chain, exit = EAX
     case 0xF5: c.e.cf = !c.e.cf; return FAULT_NONE;
     case 0xF8: c.e.cf = false; return FAULT_NONE;
     case 0xF9: c.e.cf = true;  return FAULT_NONE;
@@ -1039,6 +1041,43 @@ uint32_t step(Ctx& c) {
             if (c.fault != FAULT_NONE) return c.fault;
             return FAULT_NONE;
         }
+        case 0xA2: { // CPUID: Intel vendor; leaves past 1 report no features so
+                     // the CRT runtime dispatch settles on plain SSE2
+            const uint64_t leaf = c.e.r[2] & 0xFFFFFFFF;
+            if (leaf == 0)
+                c.e.r[0] = 1, c.e.r[3] = 0x756E6547,
+                c.e.r[1] = 0x49656E69, c.e.r[2] = 0x6C65746E;
+            else if (leaf == 1)
+                c.e.r[0] = 0x633, c.e.r[3] = 1u << 26, c.e.r[2] = 0, c.e.r[1] = 0;
+            else
+                c.e.r[0] = c.e.r[1] = c.e.r[2] = c.e.r[3] = 0;
+            return FAULT_NONE;
+        }
+        case 0x57: { // xorps dst, src: only the reg,reg zero idiom appears here
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            if (!c.oReg) return FAULT_UNSUPPORTED;
+            const int dst = c.mr.reg, src = c.mr.rm;
+            c.e.xmm[dst][0] = c.e.xmm[dst][1] = c.e.xmm[dst][0] ^ c.e.xmm[src][0];
+            c.e.xmm[dst][1] ^= c.e.xmm[src][1];
+            return FAULT_NONE;
+        }
+        case 0x12: case 0x13: { // 66 movlpd xmm, m64 / movlpd m64, xmm
+            if (!c.op66) return FAULT_UNSUPPORTED;
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            if (c.oReg) return FAULT_UNSUPPORTED;
+            const int reg = c.mr.reg;
+            const uint64_t ea = c.eaCalc();
+            if (op2 == 0x13) {
+                if (!memSt(c.e, ea, c.e.xmm[reg][0])) c.fault = FAULT_OOB;
+            } else {
+                if (!memLd(c.e, ea, c.e.xmm[reg][0])) c.fault = FAULT_OOB;
+                c.e.xmm[reg][1] = 0;
+            }
+            if (c.fault != FAULT_NONE) return c.fault;
+            return FAULT_NONE;
+        }
         case 0x0B: return FAULT_UNSUPPORTED;
         case 0x05: case 0x34: case 0x35:
             return FAULT_UNSUPPORTED;
@@ -1069,6 +1108,25 @@ uint32_t step(Ctx& c) {
             const uint64_t v = cond(c.e, op2 & 0xF) ? 1 : 0;
             if (c.oReg) { const int idx = (c.mr.rm | (c.rexB << 3)) & 15; c.reg8Write(idx, v); }
             else { const uint64_t addr = c.eaCalc(); if (!memSt(c.e, addr, static_cast<uint8_t>(v))) c.fault = FAULT_OOB; }
+            if (c.fault != FAULT_NONE) return c.fault;
+            return FAULT_NONE;
+        }
+        case 0xB0: case 0xB1: { // cmpxchg r/m, r: single-threaded, lock prefix is a no-op
+            const int osz = (op2 == 0xB1) ? (c.op66 ? 2 : 4) : 1;
+            c.decodeRm();
+            if (c.fault != FAULT_NONE) return c.fault;
+            const uint64_t dst = c.oVal(osz);
+            if (c.fault != FAULT_NONE) return c.fault;
+            const uint64_t src = c.gVal(osz);
+            const uint64_t acc = c.e.r[0] & maskSz(osz);
+            // flags match x86: ZF means exchange happened
+            c.e.zf = dst == acc;
+            if (c.e.zf) {
+                c.oSet(osz, src);
+            } else {
+                // reload dst: oVal/gVal may have consumed it via a register alias
+                c.e.r[0] = (c.e.r[0] & ~maskSz(osz)) | dst;
+            }
             if (c.fault != FAULT_NONE) return c.fault;
             return FAULT_NONE;
         }
@@ -1171,9 +1229,11 @@ static uint32_t runLoop(Emu& e) {
         Ctx c{e, l, f, e.ip};
         const uint32_t r = stepOne(c);
         if (r != FAULT_NONE) {
+            if (r == FAULT_HALT) break; // stub chain end: exit code = EAX (run86)
             if (r == FAULT_OOB) {
-                fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX\n",
-                        static_cast<unsigned long long>(e.ip));
+                fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX (off=0x%llX)\n",
+                        static_cast<unsigned long long>(e.ip),
+                        static_cast<unsigned long long>(e.ip - l.imgBase));
             }
             return r;
         }
@@ -1198,9 +1258,17 @@ uint32_t run86(Loaded& l) {
     e.r[kRSP] = e.stkEnd - 4 - 0x100;
     if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return FAULT_OOB;
     e.ip = l.imgBase;
+    if (l.pe.isDll) {
+        // DLL entry signature: _DllMainCRTStartup is stdcall ret 12, args
+        // above the return address: hinst, DLL_PROCESS_ATTACH, nullptr
+        const uint32_t hinst = static_cast<uint32_t>(l.imgBase + l.pe.imageOffset);
+        if (!memSt<uint32_t>(e, e.r[kRSP] + 4, hinst) ||
+            !memSt<uint32_t>(e, e.r[kRSP] + 8, 1) ||
+            !memSt<uint32_t>(e, e.r[kRSP] + 12, 0)) return FAULT_OOB;
+    }
 
     const uint32_t r = runLoop(e);
-    if (r != FAULT_NONE) return r;
+    if (r != FAULT_NONE && r != FAULT_HALT) return r;
     return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
 }
 

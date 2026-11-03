@@ -99,9 +99,14 @@ pytest tests\pytest -v
 - Keep code comments minimal (why only).
 
 ## Immediate Next Step
-Iteration 5 part 1 is done: `08_cpp_thread` (`std::thread`) passes on x64 and
-x86, in Release and Debug (ledger: iteration 5a). Continue iteration 5:
-`05_dll_entry` plus remaining CRT startup pieces. Threads stay join-driven,
-single-threaded inside the interpreter; stand-ins take parameters from
-guest-stack args, with arch-specific `_Thrd_t` handling (x64 by ref, x86 by
-value) preserved in `apiThrdJoin`.
+Iteration 5 parts 1+2 are done: `08_cpp_thread` (`std::thread`) and
+`05_dll_entry` (full CRT startup through DllMain, Debug and Release,
+x64 and x86) both pass pytest in Release AND Debug (ledger: iterations
+5a, 5b). hlt now ends the stub chain with exit = low32(RAX) instead of
+faulting. Continue with iteration 6: exceptions (x64 table-based
+unwinding first - RtlAddFunctionTable/Context/Unwind stand-ins currently
+fail closed - then x86 VEH). Tests: `07_cpp_exceptions`, `11_cpp_
+exceptions`, `12_seh_exceptions`, `15_nested_exceptions`. Threads stay
+join-driven, single-threaded inside the interpreter; stand-ins take
+parameters from guest-stack args, with arch-specific `_Thrd_t` handling
+(x64 by ref, x86 by value) preserved in `apiThrdJoin`.

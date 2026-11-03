@@ -88,6 +88,7 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
         const uint32_t eLfanew = *reinterpret_cast<const uint32_t*>(base + imgOff + 0x3C);
         const uint8_t* opt = base + imgOff + eLfanew + 4 + 20;
         out.pe.entryRva = *reinterpret_cast<const uint32_t*>(opt + 16);
+        out.pe.isDll = (*reinterpret_cast<const uint16_t*>(base + imgOff + eLfanew + 4 + 18) & 0x2000) != 0;
         if (out.is64) {
             out.pe.imageBase = static_cast<uint32_t>(*reinterpret_cast<const uint64_t*>(opt + 24));
             out.pe.sizeOfImage = *reinterpret_cast<const uint32_t*>(opt + 56);
@@ -145,6 +146,7 @@ int main(int argc, char** argv) {
         if (arch == 32 && l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
         if (arch == 64 && !l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
     }
+
 #ifndef _WIN64
     // 32-bit host build runs x86 shellcode only
     if (l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }

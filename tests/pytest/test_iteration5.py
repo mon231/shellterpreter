@@ -28,3 +28,25 @@ def test_thread_dual_arch():
     assert sc.exists(), "08_cpp_thread.shellcode was not built"
     r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(sc)])
     assert r.returncode == 42, (conftest.win_code(r.returncode), r.stderr[-2000:])
+
+
+def _check_dll_entry(exe_dir):
+    # DllMain returns TRUE only for DLL_PROCESS_ATTACH -> exit 1
+    r = _run(exe_dir, "05_dll_entry")
+    assert r.returncode == 1, (conftest.win_code(r.returncode), r.stderr[-2000:])
+
+
+def test_dll_entry_x64():
+    _check_dll_entry(conftest.X64_DIR)
+
+
+def test_dll_entry_x86():
+    _check_dll_entry(conftest.X86_DIR)
+
+
+def test_dll_entry_dual_arch():
+    # x64 interpreter runs the x86 DllMain startup path
+    sc = conftest.X86_DIR / "05_dll_entry.shellcode"
+    assert sc.exists(), "05_dll_entry.shellcode was not built"
+    r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(sc)])
+    assert r.returncode == 1, (conftest.win_code(r.returncode), r.stderr[-2000:])
