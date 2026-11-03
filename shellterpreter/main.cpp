@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -20,35 +20,20 @@ void freeLoaded(Loaded& l) {
         if (l.threads[i].stack) { VirtualFree(l.threads[i].stack, 0, MEM_RELEASE); l.threads[i].stack = nullptr; }
 }
 
-std::string faultMessage(uint32_t fault) {
-    switch (fault) {
-    case FAULT_UNSUPPORTED: return "unimplemented opcode";
-    case FAULT_OOB:         return "access outside emulated memory";
-    case FAULT_BAD_FILE:    return "bad shellcode file";
-    case FAULT_ALLOC:       return "memory allocation failed";
-    case FAULT_AUDIT:       return "runtime self-audit violated";
-    case FAULT_HALT:        return "hlt executed";
-    case FAULT_ARCH:        return "architecture mismatch or core not built";
-    case FAULT_ARG:         return "bad command line";
-    case FAULT_LIMIT:       return "instruction budget exhausted";
-    default:                return "unknown state";
-    }
-}
-
 uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return FAULT_BAD_FILE;
+    if (h == INVALID_HANDLE_VALUE) return fault_code(Fault::BadFile);
     DWORD hi = 0;
     const DWORD lo = GetFileSize(h, &hi);
-    if (lo == INVALID_FILE_SIZE && hi != 0) { CloseHandle(h); return FAULT_BAD_FILE; }
+    if (lo == INVALID_FILE_SIZE && hi != 0) { CloseHandle(h); return fault_code(Fault::BadFile); }
     std::vector<uint8_t> data;
     data.resize(static_cast<size_t>((static_cast<uint64_t>(hi) << 32) | lo));
     DWORD got = 0;
     if (!ReadFile(h, data.data(), static_cast<DWORD>(data.size()), &got, nullptr) ||
         got != data.size() || data.empty()) {
         CloseHandle(h);
-        return FAULT_BAD_FILE;
+        return fault_code(Fault::BadFile);
     }
     CloseHandle(h);
 
@@ -73,7 +58,7 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     const bool low = !out.is64;
     const size_t want = data.size() + 0x10000;
     void* buf = low ? allocLow(want) : VirtualAlloc(nullptr, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!buf) return FAULT_ALLOC;
+    if (!buf) return fault_code(Fault::Allocation);
     uint8_t* base = static_cast<uint8_t*>(buf);
     memcpy(base, data.data(), data.size());
 
@@ -100,21 +85,21 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
 
     const size_t kStack = 4 * 1024 * 1024;
     void* stk = low ? allocLow(kStack) : VirtualAlloc(nullptr, kStack, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!stk) { VirtualFree(buf, 0, MEM_RELEASE); return FAULT_ALLOC; }
+    if (!stk) { VirtualFree(buf, 0, MEM_RELEASE); return fault_code(Fault::Allocation); }
     out.stk = static_cast<uint8_t*>(stk);
     out.stkLen = kStack;
     out.stkBase = reinterpret_cast<uint64_t>(stk);
 
     const uint32_t err = buildFakeEnv(out);
-    if (err != FAULT_NONE) { freeLoaded(out); return err; }
-    return FAULT_NONE;
+    if (err != fault_code(Fault::None)) { freeLoaded(out); return err; }
+    return fault_code(Fault::None);
 }
 
 } // namespace stub
 
 static void printFault(uint32_t code) {
     fprintf(stderr, "shellterpreter: fault 0x%08X (%s)\n",
-            code, stub::faultMessage(code).c_str());
+            code, fault_message(code).c_str());
 }
 
 int main(int argc, char** argv) {
@@ -125,36 +110,36 @@ int main(int argc, char** argv) {
         if (a == "--x86") arch = 32;
         else if (a == "--x64") arch = 64;
         else if (!a.empty() && a[0] != '-') { if (path.empty()) path = a; }
-        else { printFault(stub::FAULT_ARG); return stub::FAULT_ARG; }
+        else { printFault(fault_code(Fault::Argument)); return fault_code(Fault::Argument); }
     }
     if (path.empty()) {
         fprintf(stderr, "usage: shellterpreter.exe <shellcode.bin> [--x86|--x64]\n");
-        return stub::FAULT_ARG;
+        return fault_code(Fault::Argument);
     }
 
     stub::Loaded l{};
     l.img = l.stk = nullptr;
     l.is64 = l.hasImage = false;
     uint32_t err = stub::loadShellcode(path, l, arch == 32);
-    if (err != stub::FAULT_NONE) { printFault(err); return static_cast<int>(err); }
+    if (err != fault_code(Fault::None)) { printFault(err); return static_cast<int>(err); }
 
     if (!l.hasImage) {
-        if (arch == 0) { printFault(stub::FAULT_ARG); stub::freeLoaded(l); return stub::FAULT_ARG; }
+        if (arch == 0) { printFault(fault_code(Fault::Argument)); stub::freeLoaded(l); return fault_code(Fault::Argument); }
         l.is64 = (arch == 64);
     }
     if (l.hasImage) {
-        if (arch == 32 && l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
-        if (arch == 64 && !l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
+        if (arch == 32 && l.is64) { printFault(fault_code(Fault::Architecture)); stub::freeLoaded(l); return fault_code(Fault::Architecture); }
+        if (arch == 64 && !l.is64) { printFault(fault_code(Fault::Architecture)); stub::freeLoaded(l); return fault_code(Fault::Architecture); }
     }
 
 #ifndef _WIN64
     // 32-bit host build runs x86 shellcode only
-    if (l.is64) { printFault(stub::FAULT_ARCH); stub::freeLoaded(l); return stub::FAULT_ARCH; }
+    if (l.is64) { printFault(fault_code(Fault::Architecture)); stub::freeLoaded(l); return fault_code(Fault::Architecture); }
 #endif
 
     std::vector<stub::ExecRange> baseline = stub::snapshotExecRanges();
 
-    uint32_t result = stub::FAULT_NONE;
+    uint32_t result = fault_code(Fault::None);
     if (l.is64) result = stub::run64(l);
     else result = stub::run86(l);
 
@@ -162,9 +147,9 @@ int main(int argc, char** argv) {
     if (stub::pageHasExecute(l.imgBase) || stub::pageHasExecute(l.stkBase) ||
         stub::pageIsWriteAndExec(l.imgBase) || stub::pageIsWriteAndExec(l.stkBase)) {
         ok = false;
-        result = stub::FAULT_AUDIT;
+        result = fault_code(Fault::Audit);
     }
-    if (ok && !stub::verifyNoNewExec(baseline)) { ok = false; result = stub::FAULT_AUDIT; }
+    if (ok && !stub::verifyNoNewExec(baseline)) { ok = false; result = fault_code(Fault::Audit); }
     stub::freeLoaded(l);
     if (result >= 0xE0000000u) { printFault(result); }
     return static_cast<int>(result);

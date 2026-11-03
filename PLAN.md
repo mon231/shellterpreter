@@ -1,182 +1,66 @@
-# shellterpreter — PLAN
+# shellterpreter — PLAN (single file: goal, status, redesign, audit, follow-ups)
 
-C++ Windows shellcode interpreter. Reads a shellcode binary from a file into a
-single `PAGE_READWRITE` allocation, emulates it instruction-by-instruction,
-and sets the process exit code to the low 32 bits of the emulated return value
-(RAX on x64, EAX on x86).
+C++ Windows shellcode interpreter. Reads shellcode from a file into one
+`PAGE_READWRITE` allocation, emulates it instruction by instruction, sets the
+process exit code to low 32 bits of RAX/EAX. Scope: position-independent raw
+binary starting at offset 0 with a return address on the stack; peor output is
+only the test corpus. An embedded `MZ`/`PE` header is used for architecture
+detection (and DllMain entry shape), never required.
 
-Scope of the shellcode format: **position-independent raw binary whose
-execution starts at offset 0 with a return address on the stack**. That is the
-only contract. The [
-peor](https://pypi.org/project/peor/) output happens to satisfy this contract and
-is what our test corpus uses, but shellterpreter does not require peor, its
-stubs, or its layout. A shellcode without an embedded PE header is valid: in
-that case the image base is the buffer start and the architecture must be
-selected explicitly (`--x86` / `--x64`). When an `MZ`/`PE` header is present,
-shellterpreter uses it for architecture detection only.
+## User decisions
 
-## User decisions (goal crafting)
+- ISA/ABI: Windows, x86 + x64; the x64 interpreter runs both, the x86 build runs x86 only (`0xE0000007` otherwise).
+- Coverage: growable common subset; unknown instruction → fail closed, never guessed.
+- Toolchain: VS solution + vcxproj all 4 configs (Release/Debug x x64/Win32), pytest gate, peor is test-pipeline-only.
+- Threads (`std::thread`) and multiple exception types are hard requirements; stand-ins take parameters from interpreter-owned state, not guest register shuffling.
+- Development proceeds test-first, iteration by iteration, each feature with tests + commit.
 
-- **ISA / ABI**: Windows, both x86 and x64. The 32-bit interpreter build runs
-  32-bit shellcode only; the 64-bit interpreter build runs x64 and x86
-  shellcode.
-- **Instruction coverage**: common growable subset; fail closed with a
-  reserved diagnostic code on anything unimplemented; the test suite drives
-  what gets added.
-- **Toolchain**: Visual Studio solution (`sln` + `vcxproj`); comprehensive
-  pytest harness. The solution contains the `shellterpreter` executable
-  project and many companion C++ projects that get compiled to EXE and then to
-  shellcode for test execution. peor (PyPI) is a **test-pipeline-only**
-  dependency: tests convert the built test PEs into shellcode binaries. peor
-  is never required to run or build shellterpreter itself.
-- **Iterations**: development proceeds iteration by iteration. First tests are
-  simple (calculations / importless PEs like peor's own test style), then more
-  and more gets implemented. Whenever a new feature is implemented it must land
-  with tests that cover it and a commit.
-- **Final delivered state**: threads and multiple types of exceptions must be
-  supported; support for simple things (calculations, relocation) comes first.
-- **Termination**: interpreter pushes a sentinel return address; emulation
-  ends when RIP reaches it; process exit code = low 32 bits of RAX/EAX.
-- **Safety evidence**: self-audit (VirtualQuery) at runtime plus a
-  build-time PE-structure check.
+## Hard invariants (never weaken)
 
-## Hard invariants (never weakened, never bypassed)
-
-1. Shellcode image pages: one `VirtualAlloc(..., PAGE_READWRITE)`; protection
-   is never changed after allocation. Stack pages: same policy. Pages never
-   become RX/RWX.
-2. The shellterpreter process must not gain any executable page after process
-   start. Runtime self-audit: snapshot all committed executable regions at
-   startup, re-snapshot before exit, fail on any difference.
-3. All emulated OS-facing services (fake PEB/TEB/module environment,
-   import/WinAPI stand-ins, syscall/ROP-relevant paths) are compiled into the
-   binary at build time.
-4. Instruction coverage is a growable common subset. Unknown instruction =
-   fail closed with a reserved fault code, never guessed semantics.
+1. Shellcode/stack/env/heap pages: one `VirtualAlloc(..., PAGE_READWRITE)`; protection never changes; never RX/RWX (runtime self-audit, build-time PE check).
+2. `unknown instruction = Fault::Unsupported` (`0xE0000001`); all stand-ins fail closed.
+3. All OS-facing fake services compiled into the binary at build time.
 
 ## Exit-code contract
 
 | Code | Meaning |
 |---|---|
-| `0x00000000..0xDFFFFFFF` | emulator-set exit code = low 32 bits of returned RAX/EAX |
-| `0xE0000001` | unsupported opcode (fail-closed) |
-| `0xE0000002` | out-of-bounds memory access |
-| `0xE0000003` | bad shellcode file |
-| `0xE0000004` | memory allocation failure |
-| `0xE0000005` | runtime self-audit violation |
-| `0xE0000006` | `hlt` executed |
-| `0xE0000007` | architecture path present in file, core not built yet |
-| `0xE0000008` | bad command line |
-| `0xE0000009` | instruction budget exhausted |
+| `0x00000000..0xDFFFFFFF` | low 32 bits of returned RAX/EAX |
+| `0xE0000001..0xE0000009` | faults: unsupported opcode, outside memory, bad file, allocation, audit violation, `hlt` (stub-chain end: exit = EAX low32), wrong arch path, bad command line, instruction budget |
 
-Sentinel return address is a fixed unmapped value; the first `ret` of the
-shellcode (its own contract, or peor's stub chain for our test corpus) falls
-there.
+## Status ledger (details live in .sdd/ledger.md)
 
-## Iterations (each lands with its tests and a commit)
+- Iterations 1-4 complete (commits c29c0c5 … 6168e74): x64 core, x86 core, relocations, fake env + WinAPI/CRT/resources stand-ins; pytest 20 green Release+Debug.
+- Iteration 5 complete (5a `std::thread` commit 5cf2b1b; 5b DLL entry commit ef0fff8): `05_dll_entry` (full CRT startup through DllMain, exit 1) and `08_cpp_thread` (join-driven threads) green x64+x86, Release+Debug; pytest 26 green; 40/40 repeat runs stable. Root fixes of 5: imm64 8-byte, CPUID both cores (SSE2-only), BT/CMPXCHG/lock both cores, xorps/movlpd x86, TEB Self pointers, memcpy/memset/CRT stand-ins, `hlt` ends stub chain with exit = EAX low32.
+- Next feature work: iteration 6 — exceptions (x64 table-based → x86 VEH; tests 07/11/12/15).
 
-### Iteration 1 — x64 positional-independent importless shellcode
-- Solution, CLI, loader (arch detect with optional embedded PE header),
-  x64 core (stubs need call/pop/lea/mov/cmp/test/add/sub/push/pop/jcc/jmp/
-  call/ret/movzx/lodsw/hlt ModRM/SIB/rip-relative), sentinel return, fault
-  codes, runtime self-audit, test PE `01_simple_calc` (importless, custom
-  entry, x64), pytest (shellcode runs, audit, fail-closed unknown opcode),
-  `tests/audit_pe.py`, `tests/build_tests.py`.
+## Module rewrite (in progress; conventions = CONTRIBUTING.md)
 
-### Iteration 2 - x86 importless shellcode
-- 32-bit core, same contract. Tests: 01_simple_calc Win32.
-- Status: complete. peor's x86 stub does fs:[0x30] PEB walk and resolves
-  AddVectoredExceptionHandler from an ntdll export table; fake TEB/PEB/Ldr/
-  ntdll stand-ins built by the loader (one extra RW region, never
-  executable), NT-function calls intercepted by the interpreter loop.
-  x64 exe runs x86 shellcode via --x86 flag (all memory kept below 4 GB).
+Behavior-preserving refactor to RAII classes, one class per file, snake_case
+full names, no namespaces / no `inline` / no raw owning pointers, shared
+templated CPU core. Each task: all 4 msbuild configs built, pytest green in
+Release AND Debug, one commit.
 
-### Iteration 3 — base relocations (complete)
-- Test project `02_relocs` (static globals + .reloc), expected exit 542.
-- x64 core: `rexUsed` flag fixed; byte-reg REX ops now decode correctly.
-- x86 core: `decodeMR` `rm=5/mod=0` fixed to absolute disp32 (`absDisp`).
-- x86 reloc stub patches verified POS-space (delta = vmInnerFileBase − ImageBase).
-- Debug builds isolated; `/INCREMENTAL:NO`; `conftest` supports `SHELLTERP_CONFIG=Debug`.
-- pytest: 13 passed (Release + Debug).
-- Next: iteration 4 (import stand-ins).
+1. `fault` module (Fault enum, fault_message).
+2. `ShellcodeFile` (RAII read) + `PeReader` (MZ/PE scan incl. decoys, arch, is_dll).
+3. `GuestRegion` (RAII VirtualAlloc/VirtualFree, rule of 5) absorbs image/stack/env/heap/thread stacks.
+4. `GuestEnvironment` + `ApiTable` + `ApiStandins` (replaces export_resolver; arch-parameterized layout constants).
+5. `Operand` (std::variant) + `InstructionDecoder` (shared, arch-tagged) — replaces the malformed `OpRm` clusters.
+6. `Cpu<Architecture>` template absorbs vm64/vm86 stepwise (sub-commit a: state/run loop; b: ALU+jcc/call/ret; c: remaining opcodes; d: delete old cores).
+7. `ThreadContext` + RAII audit + `main` sweep; vcxproj updated, old files deleted.
 
-### Iteration 4 — fake PEB/TEB/environment + import stand-ins
-- Compiled-in module table; emulated `LoadLibraryA`/`GetProcAddress`/...
-  stand-ins executed natively inside shellterpreter.
-- Tests: `03_winapi_messagebox`, `04_crt_printf_rand`, `09_resources`.
-- Status: `03_winapi_messagebox` complete (x64 + x86, exit 102; negative
-  checks covered). `export_resolver.{hpp,cpp}` build the fake env (TEB/PEB/Ldr
-  chain, fake kernel32 + ntdll PE headers with export dirs, user32 module
-  token) and register compiled-in stand-ins
-  (LoadLibraryA/GetProcAddress/MessageBoxA/RtlAdd*). vm64/vm86 run loops
-  intercept calls at stand-in addresses; x64 = SysV-free MS x64 ABI via
-  RCX/RDX/R8/R9 + shadow space, x86 = stdcall with callee-cleaned args.
-- vm64 `ApiEntry/Loaded/lookupApi` replaced iteration-2's per-call ntdll hook.
-- Root fixes: vm64 stands-in args read RCX not RAX; both cores' `doSubF`
-  used `flagsLogic` (clears CF — broke `cmp`+`ja` in the MZ-scan stubs) now
-  uses `flagsNZP`; ordinal/import-name threshold `kOrdinalMax = 0x10000`
-  (stub ordinals are masked 0xffff, name pointers >= imgBase >= 0x10000);
-  vm86 added `pusha`/`popa` (IMPORTS_32 opens with `pushal`).
-- Liberation: env layout documented in `export_resolver.cpp` header comment.
-- pytest: 18 passed in Release and Debug (incl. audit tests).
-- `04_crt_printf_rand` complete (x64 + x86): real PE imports enumerated from
-  the built exe = one module `msvcrt.dll` with `printf`, `rand`, `srand`
-  (by name, no ordinals). A hand-generated import lib
-  (`tests/test_projects/04_crt_printf_rand/msvcrt.mini.def` +
-  `msvcrt_mini_x64.lib` / `msvcrt_mini_Win32.lib`) supplies them because the
-  UCRT headers model `printf` as an inline wrapper over
-  `__stdio_common_vfprintf`; no shipped lib exports `__imp_printf`.
-  Stand-ins: minimal `printf` (%d %i %u %x %X %c %s %%, buffered, unsupported
-  conversion -> -1, writes guest text to interpreter stdout), MSVCRT LCG
-  `rand`/`srand` (shared seed, caller's 5 draws match a Python model).
-  `ApiEntry.callerCleans` marks x86 cdecl stand-ins (caller pops args).
-- Arch dispatch: x64 interpreter runs x64 and x86 shellcode; the 32-bit
-  interpreter runs x86 only and fails closed with `0xE0000007` on x64
-  shellcode (`test_arch_dispatch`).
-- `09_resources` complete (x64 + x86, exit 600): real PE imports
-  enumerated from the built exe = one module `KERNEL32.dll` with
-  `FindResourceA`, `SizeofResource` (by name). Stand-ins parse the
-  shellcode's own mapped PE image: the resource directory entry is read
-  from the PE data directory, and every directory offset is relative to
-  the resource section RVA (name strings, subdirectory offsets, data
-  entries). `FindResourceA` matches type -> name -> language (any language
-  fallback) and returns the guest address of the leaf
-  `IMAGE_RESOURCE_DATA_ENTRY`; `SizeofResource` reads that entry's `Size`.
-  Missing resources return NULL, a bad handle returns 0.
-- Iteration 4 complete: pytest 20 passed in Release and Debug.
+## Audit findings (2026-11-03; full report in session log; fix in this order)
 
-### Iteration 5 — CRT basics
-- Tests: `05_dll_entry`, `08_cpp_thread` (threads as interpreter-driven
-  contexts), CRT startup pieces.
-- Threads are a hard requirement (`std::thread` in the test corpus too): the
-  interpreter must run the shellcode's thread entry points itself, as
-  emulated contexts on separate interpreter stacks. Stand-in/syscall
-  entry points must take their parameters from interpreter-owned globals
-  rather than shuffling them through guest registers.
+1. `rep movs/stos` bypasses the instruction budget (one emulated instruction = up to RCX guest iterations; worst case minutes of apparent hang; budget path untestable). Fix: count/cap iterations inside the string-op loops in both cores — land with the Cpu template.
+2. No test pins the instruction budget fault `0xE0000009` (budget = 5e9 makes such a test slow). Fix before/with task 6: expose a test-only budget (env var `SHELLTERP_BUDGET`, read once at startup, default unchanged; pytest asserts 20-byte `jmp $` → 0xE0000009.
+3. PE header fields read past file end into the 64 KB slack for truncated PEs (`main.cpp:88-98`). Fix: `imgOff + eLfanew + 0x400 <= data.size()` else `Fault::BadFile` (land with task 2).
+4. `ApiEntry apis[32]` / `ThreadCtx threads[8]` raw arrays with overflow risk (9th `_beginthreadex` = out-of-bounds host write). Fix: checked registry in task 4/7.
+5. `lookupApi` linear scan per guest step. Fix opportunistically in task 6 (range check over stand-in span → O(1)).
+6. `loadShellcode` raw `CreateFileA`/`CloseHandle` early-return plumbing → task 2's RAII.
+7. Housekeeping to do with first commit: commit `CONTRIBUTING.md` + `docs/` plan/spec, add `.superpowers/` to `.gitignore`.
+8. README addition (task 7): exit/fault code table.
 
-### Iteration 6 — exceptions
-- x64 table-based first, then x86 VEH-model. Multiple exception types must be
-  supported by the end.
-- Tests: `07_cpp_exceptions`, `11_cpp_exceptions`, `12_seh_exceptions`,
-  `15_nested_exceptions`.
+## Follow-ups (feature track after the rewrite)
 
-### Iteration 7 — hardening + docs
-- Fuzz-ish tests, README architecture section, final audit.
-
-## Evidence standard per feature
-
-- `pytest tests\pytest` green, including audit tests.
-- Both platforms build: `python tests\build_tests.py Release x64` and
-  `... Release Win32`.
-- `tests/audit_pe.py` passes on shellterpreter.exe (both arch) and on all
-  test PEs: no RWX sections; no executable sections beyond the compile-time
-  image's own (`.text` for shellterpreter; also allows the known test-PE
-  sections).
-- Every feature PR lands with its tests and a commit.
-
-## Stop honesty
-
-If a feature cannot be delivered inside the invariants (e.g. an exception
-mechanism that would require executable pages), stop and report: attempted
-paths, exact missing capability, evidence. Never fix it by weakening an
-invariant.
+- Iteration 6 exceptions: x64 RtlAddFunctionTable/unwind stand-ins currently fail closed (`ST_CRTFAIL`); x86 VEH model next; `_except_handler4_common`/`__C_specific_handler` move from no-op to real.
+- Iteration 7: fuzz-ish tests, README, final audit. `_initterm`/`_initterm_e` upgrade path from paste-table skip to driven version if tests add C++ static initializers.

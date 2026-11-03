@@ -1,4 +1,4 @@
-#include "export_resolver.hpp"
+﻿#include "export_resolver.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -253,7 +253,7 @@ static uint64_t apiMemcpy(Loaded& l, const uint64_t* args) {
     GuestMem dst = guestMem(l, args[0]);
     GuestMem src = guestMem(l, args[1]);
     if (!dst.p || dst.avail < n || !src.p || src.avail < n) {
-        l.fault = FAULT_OOB;
+        l.fault = fault_code(Fault::OutsideMemory);
         return 0;
     }
     memmove(dst.p, src.p, n);
@@ -265,7 +265,7 @@ static uint64_t apiMemset(Loaded& l, const uint64_t* args) {
     if (!n) return args[0];
     GuestMem dst = guestMem(l, args[0]);
     if (!dst.p || dst.avail < n) {
-        l.fault = FAULT_OOB;
+        l.fault = fault_code(Fault::OutsideMemory);
         return 0;
     }
     memset(dst.p, static_cast<int>(args[1] & 0xFF), n);
@@ -526,14 +526,14 @@ static uint64_t apiFree(Loaded&, const uint64_t*) { return 0; }
 static uint64_t apiCallNewh(Loaded&, const uint64_t*) { return 0; } // no new-handler
 
 static uint64_t apiCrtFail(Loaded& l, const uint64_t*) {
-    l.fault = FAULT_UNSUPPORTED;
+    l.fault = fault_code(Fault::UnsupportedInstruction);
     return 0;
 }
 
 uint32_t buildFakeEnv(Loaded& l) {
     constexpr size_t kEnv = 0x2000;
     void* p = allocLow(kEnv);
-    if (!p) return FAULT_ALLOC;
+    if (!p) return fault_code(Fault::Allocation);
     uint8_t* m = static_cast<uint8_t*>(p);
     l.env = m;
     l.envLen = kEnv;
@@ -547,12 +547,12 @@ uint32_t buildFakeEnv(Loaded& l) {
     // guest heap: bump allocator for std::thread's operator new (malloc) and
     // any other dynamic allocation; freed only on process exit
     void* hp = allocLow(0x100000);
-    if (!hp) return FAULT_ALLOC;
+    if (!hp) return fault_code(Fault::Allocation);
     l.heap = static_cast<uint8_t*>(hp);
     l.heapNext = reinterpret_cast<uint64_t>(hp);
     l.heapEnd = l.heapNext + 0x100000;
     l.threadCount = 0;
-    l.fault = FAULT_NONE;
+    l.fault = fault_code(Fault::None);
 
     // module chain: head -> ntdll (node2) -> kernel32 (node3)
     put32(0x400, B + 0x500);
@@ -646,7 +646,7 @@ uint32_t buildFakeEnv(Loaded& l) {
     };
     l.apiCount = static_cast<uint32_t>(sizeof(apis) / sizeof(apis[0]));
     memcpy(l.apis, apis, sizeof(apis));
-    return FAULT_NONE;
+    return fault_code(Fault::None);
 }
 
 } // namespace stub

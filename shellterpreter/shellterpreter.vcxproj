@@ -124,6 +124,8 @@
     <ClCompile Include="vm64.cpp" />
     <ClCompile Include="vm86.cpp" />
     <ClCompile Include="audit.cpp" />
+    <ClCompile Include="fault.cpp" />
+    <ClInclude Include="fault.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vm.hpp" />

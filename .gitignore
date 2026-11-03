@@ -22,3 +22,5 @@ Release/
 __pycache__/
 .pytest_cache/
 .sdd/
+
+.superpowers/
