@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +9,7 @@
 #include "audit.hpp"
 #include "export_resolver.hpp"
 #include "shellcode_file.hpp"
+#include "pe_reader.hpp"
 
 namespace stub {
 
@@ -26,23 +27,9 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     if (!file.open(path)) return fault_code(Fault::BadFile);
     const std::vector<uint8_t>& data = file.bytes();
 
-    uint64_t imgOff = 0;
-    uint16_t machine = 0;
-    bool hasImage = false;
-    for (size_t s = 0; s + 2 < data.size() && s < 0x10000; ++s) {
-        if (data[s] != 'M' || data[s + 1] != 'Z') continue;
-        if (s + 0x40 > data.size()) continue;
-        const uint32_t eLfanew = *reinterpret_cast<const uint32_t*>(&data[s + 0x3C]);
-        if (eLfanew > 0x1000) continue;
-        const size_t peOff = s + eLfanew;
-        if (peOff + 6 > data.size()) continue;
-        const uint8_t* pk = &data[peOff];
-        if (!(pk[0] == 'P' && pk[1] == 'E' && pk[2] == 0 && pk[3] == 0)) continue;
-        machine = static_cast<uint16_t>(pk[4] | (pk[5] << 8));
-        imgOff = s;
-        hasImage = true;
-        break;
-    }
+    PeReader pe_reader;
+    const bool hasImage = pe_reader.scan(data);
+    const uint16_t machine = pe_reader.machine();
 
     const bool low = !out.is64;
     const size_t want = data.size() + 0x10000;
@@ -54,23 +41,9 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     out.img = base;
     out.imgLen = want;
     out.imgBase = reinterpret_cast<uint64_t>(base);
-    out.pe.imageOffset = imgOff;
+    out.pe = pe_reader.info();
     out.hasImage = hasImage;
     out.is64 = hasImage ? (machine == 0x8664) : !force86;
-
-    if (hasImage) {
-        const uint32_t eLfanew = *reinterpret_cast<const uint32_t*>(base + imgOff + 0x3C);
-        const uint8_t* opt = base + imgOff + eLfanew + 4 + 20;
-        out.pe.entryRva = *reinterpret_cast<const uint32_t*>(opt + 16);
-        out.pe.isDll = (*reinterpret_cast<const uint16_t*>(base + imgOff + eLfanew + 4 + 18) & 0x2000) != 0;
-        if (out.is64) {
-            out.pe.imageBase = static_cast<uint32_t>(*reinterpret_cast<const uint64_t*>(opt + 24));
-            out.pe.sizeOfImage = *reinterpret_cast<const uint32_t*>(opt + 56);
-        } else {
-            out.pe.imageBase = *reinterpret_cast<const uint32_t*>(opt + 28);
-            out.pe.sizeOfImage = *reinterpret_cast<const uint32_t*>(opt + 56);
-        }
-    }
 
     const size_t kStack = 4 * 1024 * 1024;
     void* stk = low ? allocLow(kStack) : VirtualAlloc(nullptr, kStack, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);

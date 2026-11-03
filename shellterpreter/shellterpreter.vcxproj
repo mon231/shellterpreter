@@ -126,7 +126,10 @@
     <ClCompile Include="audit.cpp" />
     <ClCompile Include="fault.cpp" />
     <ClCompile Include="shellcode_file.cpp" />
+    <ClCompile Include="pe_reader.cpp" />
     <ClInclude Include="fault.hpp" />
+    <ClInclude Include="shellcode_file.hpp" />
+    <ClInclude Include="pe_reader.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vm.hpp" />

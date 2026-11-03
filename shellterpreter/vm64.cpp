@@ -1,4 +1,4 @@
-﻿#include "vm.hpp"
+#include "vm.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -1318,10 +1318,10 @@ uint32_t run64(Loaded& l) {
     e.r[kRSP] = e.stkEnd - 8 - 0x100;
     if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return fault_code(Fault::OutsideMemory);
     e.ip = l.imgBase;
-    if (l.pe.isDll) {
+    if (l.pe.is_dll) {
         // DLL entry signature: DllMain(hinst, DLL_PROCESS_ATTACH, nullptr);
         // hinst = guest address of the image's PE header
-        e.r[1] = l.imgBase + l.pe.imageOffset;
+        e.r[1] = l.imgBase + l.pe.image_offset;
         e.r[2] = 1;
         e.r[3] = 0;
     }

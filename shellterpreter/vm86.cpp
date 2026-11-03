@@ -1,4 +1,4 @@
-﻿#include "vm.hpp"
+#include "vm.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -1258,10 +1258,10 @@ uint32_t run86(Loaded& l) {
     e.r[kRSP] = e.stkEnd - 4 - 0x100;
     if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return fault_code(Fault::OutsideMemory);
     e.ip = l.imgBase;
-    if (l.pe.isDll) {
+    if (l.pe.is_dll) {
         // DLL entry signature: _DllMainCRTStartup is stdcall ret 12, args
         // above the return address: hinst, DLL_PROCESS_ATTACH, nullptr
-        const uint32_t hinst = static_cast<uint32_t>(l.imgBase + l.pe.imageOffset);
+        const uint32_t hinst = static_cast<uint32_t>(l.imgBase + l.pe.image_offset);
         if (!memSt<uint32_t>(e, e.r[kRSP] + 4, hinst) ||
             !memSt<uint32_t>(e, e.r[kRSP] + 8, 1) ||
             !memSt<uint32_t>(e, e.r[kRSP] + 12, 0)) return fault_code(Fault::OutsideMemory);

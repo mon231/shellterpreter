@@ -1,22 +1,16 @@
-﻿#pragma once
+#pragma once
 #include <cstdint>
 #include <cstddef>
 #include <string>
 #include <vector>
 #include "fault.hpp"
+#include "pe_reader.hpp"
 
 namespace stub {
 
 
 constexpr uint64_t kSentinel = 0x0000BAD0C0FFEE10ull;
 
-struct PeInfo {
-    uint64_t imageOffset;
-    uint32_t entryRva;
-    uint32_t imageBase;
-    uint32_t sizeOfImage;
-    bool     isDll; // IMAGE_FILE_DLL: entry gets DllMain args
-};
 
 // Native stand-in registered by the loader. nargs counts the call-site
 // arguments (x64 keeps the first 4); the run loop intercepts ip == addr,

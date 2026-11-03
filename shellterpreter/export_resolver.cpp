@@ -1,4 +1,4 @@
-﻿#include "export_resolver.hpp"
+#include "export_resolver.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -345,9 +345,9 @@ static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
 // so FindResourceA/SizeofResource walk its real resource directory
 static bool imgRead(const Loaded& l, uint64_t off, void* dst, size_t n) {
     if (!l.hasImage) return false;
-    const uint64_t avail = l.imgLen > l.pe.imageOffset ? l.imgLen - l.pe.imageOffset : 0;
+    const uint64_t avail = l.imgLen > l.pe.image_offset ? l.imgLen - l.pe.image_offset : 0;
     if (off > avail || n > avail - off) return false;
-    memcpy(dst, l.img + l.pe.imageOffset + off, n);
+    memcpy(dst, l.img + l.pe.image_offset + off, n);
     return true;
 }
 
@@ -427,11 +427,11 @@ static uint64_t apiFindResourceA(Loaded& l, const uint64_t* args) {
         if (!resFirst(l, res, nameRel, langRel, dir) || dir) return 0; // any language
     }
     // handle = guest address of the data entry, decoded again by SizeofResource
-    return l.imgBase + l.pe.imageOffset + res + langRel;
+    return l.imgBase + l.pe.image_offset + res + langRel;
 }
 
 static uint64_t apiSizeofResource(Loaded& l, const uint64_t* args) {
-    const uint64_t imageGuest = l.imgBase + l.pe.imageOffset;
+    const uint64_t imageGuest = l.imgBase + l.pe.image_offset;
     if (args[1] < imageGuest) return 0;
     // IMAGE_RESOURCE_DATA_ENTRY: DataRVA, Size, CodePage, Reserved
     uint32_t size = 0;
