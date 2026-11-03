@@ -124,8 +124,7 @@
     <ClCompile Include="instruction_decoder.cpp" />
     <ClCompile Include="guest_environment.cpp" />
     <ClCompile Include="api_standins.cpp" />
-    <ClCompile Include="vm64.cpp" />
-    <ClCompile Include="vm86.cpp" />
+    <ClCompile Include="cpu.cpp" />
     <ClCompile Include="audit.cpp" />
     <ClCompile Include="fault.cpp" />
     <ClCompile Include="shellcode_file.cpp" />
@@ -144,6 +143,7 @@
     <ClInclude Include="guest_environment.hpp" />
     <ClInclude Include="api_standins.hpp" />
     <ClInclude Include="audit.hpp" />
+    <ClInclude Include="cpu.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
