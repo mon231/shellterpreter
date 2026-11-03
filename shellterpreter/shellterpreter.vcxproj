@@ -120,7 +120,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
-        <ClCompile Include="api_table.cpp" />
+            <ClCompile Include="api_table.cpp" />
+    <ClCompile Include="instruction_decoder.cpp" />
     <ClCompile Include="guest_environment.cpp" />
     <ClCompile Include="api_standins.cpp" />
     <ClCompile Include="vm64.cpp" />
@@ -137,7 +138,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vm.hpp" />
-        <ClInclude Include="api_table.hpp" />
+            <ClInclude Include="api_table.hpp" />
+    <ClInclude Include="instruction_decoder.hpp" />
+    <ClInclude Include="operand.hpp" />
     <ClInclude Include="guest_environment.hpp" />
     <ClInclude Include="api_standins.hpp" />
     <ClInclude Include="audit.hpp" />

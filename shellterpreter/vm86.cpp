@@ -1,4 +1,5 @@
 #include "vm.hpp"
+#include "instruction_decoder.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -24,16 +25,6 @@ struct Emu {
     uint64_t budget = kInstrBudget;
     uint64_t xmm[8][2] = {}; // SSE regs: only movlpd/xorps data flow the CRT uses
 };
-
-inline unsigned popcnt8(uint8_t v) {
-    unsigned n = 0;
-    while (v) { n += v & 1; v >>= 1; }
-    return n;
-}
-constexpr uint64_t kWmask[9] = { 0, 0xFF, 0xFFFF, 0, 0xFFFFFFFFull, 0, 0, 0, ~0ull };
-constexpr unsigned kWbits[9] = { 0, 8, 16, 0, 32, 0, 0, 0, 64 };
-inline uint64_t maskSz(int sz) { return kWmask[sz]; }
-inline unsigned bitsSz(int sz) { return kWbits[sz]; }
 
 inline void flagsLogic(Emu& e, int sz, uint64_t res) {
     e.cf = e.of = false;
@@ -120,103 +111,6 @@ inline bool pop64(Emu& e, uint64_t& v) {
     return true;
 }
 
-struct Fetch {
-    const uint8_t* data; size_t len; size_t pos;
-    uint8_t u8() { return data[pos++]; }
-    uint16_t u16() { uint16_t v; memcpy(&v, data + pos, 2); pos += 2; return v; }
-    uint32_t u32() { uint32_t v; memcpy(&v, data + pos, 4); pos += 4; return v; }
-    uint64_t u64() { uint64_t v; memcpy(&v, data + pos, 8); pos += 8; return v; }
-};
-
-struct MR {
-    int mod = 3, reg = 0, rm = 0;
-    bool hasSib = false;
-    int sibBase = 0, sibIndex = 0, sibScale = 0;
-    int64_t disp = 0;
-    bool absDisp = false;
-};
-
-uint32_t decodeMR(Fetch& f, MR& m) {
-    const uint8_t byte = f.u8();
-    m.mod = byte >> 6;
-    m.reg = (byte >> 3) & 7;
-    m.rm = byte & 7;
-    m.hasSib = false;
-    m.absDisp = false;
-    m.disp = 0;
-    if (m.mod == 3) return fault_code(Fault::None);
-    if (m.rm == 4) {
-        m.hasSib = true;
-        const uint8_t sib = f.u8();
-        m.sibScale = sib >> 6;
-        m.sibIndex = (sib >> 3) & 7;
-        m.sibBase = sib & 7;
-        if (m.sibBase == 5 && m.mod == 0) { m.disp = static_cast<int64_t>(f.u32()); return fault_code(Fault::None); }
-        if (m.mod == 1) m.disp = static_cast<int8_t>(f.u8());
-        else if (m.mod == 2) m.disp = static_cast<int32_t>(f.u32());
-        return fault_code(Fault::None);
-    }
-    if (m.rm == 5 && m.mod == 0) { m.absDisp = true; m.disp = static_cast<int64_t>(f.u32()); return fault_code(Fault::None); }
-    if (m.mod == 1) m.disp = static_cast<int8_t>(f.u8());
-    else if (m.mod == 2) m.disp = static_cast<int32_t>(f.u32());
-    return fault_code(Fault::None);
-}
-
-inline bool cond(Emu& e, uint8_t cc) {
-    switch (cc & 0xF) {
-    case 0x0: return e.of; case 0x1: return !e.of;
-    case 0x2: return e.cf; case 0x3: return !e.cf;
-    case 0x4: return e.zf; case 0x5: return !e.zf;
-    case 0x6: return e.cf || e.zf; case 0x7: return !e.cf && !e.zf;
-    case 0x8: return e.sf; case 0x9: return !e.sf;
-    case 0xA: return e.pf; case 0xB: return !e.pf;
-    case 0xC: return e.sf != e.of; case 0xD: return e.sf == e.of;
-    case 0xE: return e.zf || (e.sf != e.of);
-    default:  return !e.zf && (e.sf == e.of);
-    }
-}
-
-struct Oprm {
-    bool isReg;
-    int regIdx;
-    uint64_t addr;
-};
-
-uint64_t oRead(Emu& e, const Oprm& o, int sz, uint32_t& fault) {
-    if (o.isReg) return e.r[o.regIdx & 15] & maskSz(sz);
-    switch (sz) {
-    case 1: { uint8_t v; if (!memLd(e, o.addr, v)) { fault = fault_code(Fault::OutsideMemory); return 0; } return v; }
-    case 2: { uint16_t v; if (!memLd(e, o.addr, v)) { fault = fault_code(Fault::OutsideMemory); return 0; } return v; }
-    case 4: { uint32_t v; if (!memLd(e, o.addr, v)) { fault = fault_code(Fault::OutsideMemory); return 0; } return v; }
-    case 8: { uint64_t v; if (!memLd(e, o.addr, v)) { fault = fault_code(Fault::OutsideMemory); return 0; } return v; }
-    }
-    fault = fault_code(Fault::UnsupportedInstruction); return 0;
-}
-void oWrite(Emu& e, const Oprm& o, int sz, uint64_t v, uint32_t& fault) {
-    if (o.isReg) {
-        if (sz == 4) { e.r[o.regIdx & 15] = v & 0xFFFFFFFFull; return; }
-        const uint64_t keep = ~maskSz(sz);
-        e.r[o.regIdx & 15] = (e.r[o.regIdx & 15] & keep) | (v & maskSz(sz));
-        return;
-    }
-    switch (sz) {
-    case 1: if (!memSt(e, o.addr, static_cast<uint8_t>(v))) fault = fault_code(Fault::OutsideMemory); break;
-    case 2: if (!memSt(e, o.addr, static_cast<uint16_t>(v))) fault = fault_code(Fault::OutsideMemory); break;
-    case 4: if (!memSt(e, o.addr, static_cast<uint32_t>(v))) fault = fault_code(Fault::OutsideMemory); break;
-    case 8: if (!memSt(e, o.addr, v)) fault = fault_code(Fault::OutsideMemory); break;
-    default: fault = fault_code(Fault::UnsupportedInstruction); break;
-    }
-}
-
-inline uint64_t sext(int from, uint64_t v) {
-    switch (from) {
-    case 1: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(v & 0xFF)));
-    case 2: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(v & 0xFFFF)));
-    case 4: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v & 0xFFFFFFFFull)));
-    default: return v;
-    }
-}
-
 struct Ctx {
     Emu& e;
     Loaded& l;
@@ -228,10 +122,14 @@ struct Ctx {
     bool rep = false;
     uint32_t fault = fault_code(Fault::None);
     MR mr;
-    Oprm o{};  // r/m operand after decodeRm
-    Oprm g{};  // reg operand from modrm.reg
-    bool oReg = false;
+    Operand o{ OperandMemory{} };  // r/m operand after decodeRm
+    Operand g{};                   // reg operand from modrm.reg
     bool ipSet = false;
+
+    bool oIsReg() const { return std::holds_alternative<OperandRegister>(o); }
+    uint8_t oRegIdx() const { return std::get<OperandRegister>(o).index; }
+    uint64_t oAddr() const { return std::get<OperandMemory>(o).address; }
+    uint8_t gRegIdx() const { return std::get<OperandRegister>(g).index; }
 
     void castSet(int idx, int sz, uint64_t v) {
         if (sz == 4) { e.r[idx & 15] = v & 0xFFFFFFFFull; return; }
@@ -242,14 +140,11 @@ struct Ctx {
 
     uint32_t decodeRm() {
         if (fault != fault_code(Fault::None)) return fault;
-        uint32_t r = decodeMR(f, mr);
+        const uint32_t r = decodeMR<Architecture::X86>(f, mr);
         if (r != fault_code(Fault::None)) { fault = r; return r; }
-        oReg = mr.mod == 3;
-        o.isReg = oReg;
-        const int idx = mr.rm | (rexB << 3);
-        o.regIdx = idx;
-        g.isReg = true;
-        g.regIdx = mr.reg | (rexR << 3);
+        o = mr.mod == 3 ? Operand{ OperandRegister{ static_cast<uint8_t>(mr.rm | (rexB << 3)) } }
+                        : Operand{ OperandMemory{} };
+        g = Operand{ OperandRegister{ static_cast<uint8_t>(mr.reg | (rexR << 3)) } };
         return fault_code(Fault::None);
     }
 
@@ -270,27 +165,19 @@ struct Ctx {
     }
 
     uint64_t oVal(int sz) {
-        if (oReg) { o.addr = 0; return e.r[o.regIdx & 15] & maskSz(sz); }
-        o.addr = eaCalc();
-        if (sz == 8) { uint64_t v; if (!memLd(e, o.addr, v)) fault = fault_code(Fault::OutsideMemory); return v; }
-        return oRead(e, o, sz, fault);
+        if (oIsReg()) return e.r[oRegIdx() & 15] & maskSz(sz);
+        o = Operand{ OperandMemory{ eaCalc() } };
+        return operandRead(e, o, sz, fault);
     }
     void oSet(int sz, uint64_t v) {
-        if (oReg) {
-            if (sz == 4) { e.r[o.regIdx & 15] = v & 0xFFFFFFFFull; return; }
-            const uint64_t keep = ~maskSz(sz);
-            e.r[o.regIdx & 15] = (e.r[o.regIdx & 15] & keep) | (v & maskSz(sz));
-            return;
-        }
-        const uint64_t addr = eaCalc();
-        o.addr = addr;
-        oWrite(e, o, sz, v, fault);
+        if (!oIsReg()) o = Operand{ OperandMemory{ eaCalc() } };
+        operandWrite(e, o, sz, v, fault);
     }
-    uint64_t gVal(int sz) { return e.r[g.regIdx & 15] & maskSz(sz); }
+    uint64_t gVal(int sz) { return e.r[gRegIdx() & 15] & maskSz(sz); }
     void gSet(int sz, uint64_t v) {
-        if (sz == 4) { e.r[g.regIdx & 15] = v & 0xFFFFFFFFull; return; }
+        if (sz == 4) { e.r[gRegIdx() & 15] = v & 0xFFFFFFFFull; return; }
         const uint64_t keep = ~maskSz(sz);
-        e.r[g.regIdx & 15] = (e.r[g.regIdx & 15] & keep) | (v & maskSz(sz));
+        e.r[gRegIdx() & 15] = (e.r[gRegIdx() & 15] & keep) | (v & maskSz(sz));
     }
 
     uint64_t imm64(int sz, bool signImm8) {
@@ -318,18 +205,18 @@ struct Ctx {
     }
 
     uint64_t o8Read() {
-        if (oReg) return reg8Read(o.regIdx);
-        o.addr = eaCalc();
-        uint8_t v; if (!memLd(e, o.addr, v)) fault = fault_code(Fault::OutsideMemory);
+        if (oIsReg()) return reg8Read(oRegIdx());
+        o = Operand{ OperandMemory{ eaCalc() } };
+        uint8_t v; if (!memLd(e, oAddr(), v)) fault = fault_code(Fault::OutsideMemory);
         return v;
     }
     void o8Write(uint64_t v) {
-        if (oReg) { reg8Write(o.regIdx, v); return; }
-        const uint64_t addr = eaCalc();
-        if (!memSt(e, addr, static_cast<uint8_t>(v))) fault = fault_code(Fault::OutsideMemory);
+        if (oIsReg()) { reg8Write(oRegIdx(), v); return; }
+        o = Operand{ OperandMemory{ eaCalc() } };
+        if (!memSt(e, oAddr(), static_cast<uint8_t>(v))) fault = fault_code(Fault::OutsideMemory);
     }
-    uint64_t g8Read() { return reg8Read(g.regIdx); }
-    void g8Write(uint64_t v) { reg8Write(g.regIdx, v); }
+    uint64_t g8Read() { return reg8Read(gRegIdx()); }
+    void g8Write(uint64_t v) { reg8Write(gRegIdx(), v); }
 };
 
 
@@ -602,7 +489,7 @@ uint32_t step(Ctx& c) {
     case 0x8D: {
         c.decodeRm();
         if (c.fault != fault_code(Fault::None)) return c.fault;
-        if (c.oReg) return fault_code(Fault::UnsupportedInstruction);
+        if (c.oIsReg()) return fault_code(Fault::UnsupportedInstruction);
         const uint64_t a = c.eaCalc();
         if (c.rexW) c.gSet(8, a); else if (c.op66) c.gSet(2, a & 0xFFFF); else c.gSet(4, a);
         if (c.fault != fault_code(Fault::None)) return c.fault;
@@ -1056,7 +943,7 @@ uint32_t step(Ctx& c) {
         case 0x57: { // xorps dst, src: only the reg,reg zero idiom appears here
             c.decodeRm();
             if (c.fault != fault_code(Fault::None)) return c.fault;
-            if (!c.oReg) return fault_code(Fault::UnsupportedInstruction);
+            if (!c.oIsReg()) return fault_code(Fault::UnsupportedInstruction);
             const int dst = c.mr.reg, src = c.mr.rm;
             c.e.xmm[dst][0] = c.e.xmm[dst][1] = c.e.xmm[dst][0] ^ c.e.xmm[src][0];
             c.e.xmm[dst][1] ^= c.e.xmm[src][1];
@@ -1066,7 +953,7 @@ uint32_t step(Ctx& c) {
             if (!c.op66) return fault_code(Fault::UnsupportedInstruction);
             c.decodeRm();
             if (c.fault != fault_code(Fault::None)) return c.fault;
-            if (c.oReg) return fault_code(Fault::UnsupportedInstruction);
+            if (c.oIsReg()) return fault_code(Fault::UnsupportedInstruction);
             const int reg = c.mr.reg;
             const uint64_t ea = c.eaCalc();
             if (op2 == 0x13) {
@@ -1106,7 +993,7 @@ uint32_t step(Ctx& c) {
             c.decodeRm();
             if (c.fault != fault_code(Fault::None)) return c.fault;
             const uint64_t v = cond(c.e, op2 & 0xF) ? 1 : 0;
-            if (c.oReg) { const int idx = (c.mr.rm | (c.rexB << 3)) & 15; c.reg8Write(idx, v); }
+            if (c.oIsReg()) { const int idx = (c.mr.rm | (c.rexB << 3)) & 15; c.reg8Write(idx, v); }
             else { const uint64_t addr = c.eaCalc(); if (!memSt(c.e, addr, static_cast<uint8_t>(v))) c.fault = fault_code(Fault::OutsideMemory); }
             if (c.fault != fault_code(Fault::None)) return c.fault;
             return fault_code(Fault::None);

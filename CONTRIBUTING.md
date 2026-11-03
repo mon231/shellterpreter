@@ -21,7 +21,7 @@ classes, RAII and honest names. Read this before you touch any source file.
 - **Fields start with `_`.** Example: `_image_base`, `_exit_code`. Function
   parameters and locals do not get the prefix.
 - **snake_case everywhere**: fields, variables, arguments, function names,
-  file names. Types stay PascalCase (`VirtualMemory`, `OpcodeDecoder`).
+  file names. Types/FileName stay PascalCase (`VirtualMemory`, `OpcodeDecoder`).
 
 ## Naming
 
