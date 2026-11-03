@@ -39,17 +39,16 @@ Iterations 1-5 complete (pytest 26 green, Release AND Debug):
 - Stand-in architecture so far: x64 MS ABI RCX/RDX/R8/R9 + shadow space; x86 stdcall callee-pops (`ApiEntry.callerCleans` marks cdecl); buffered `printf` (%d %i %u %x %X %c %s %%), MSVCRT LCG `rand`/`srand`, real import enumeration from the built exe.
 - Core fixes landed this era: `doSubF` → `flagsNZP` (cmp+ja was broken), ordinal threshold `kOrdinalMax = 0x10000` (stub ordinals masked 0xffff), `pusha`/`popa` x86, `div`/`idiv` 8/16/32 signed+unsigned x86, stand-in arg array `args[8]` (was OOB at indices 4..7), rsp/esp starts 0x100 below stack end so vararg peeks stay inside the region.
 - Module rewrite tasks 1-2 done: `Fault` enum + `fault_code`/`fault_message` in `fault.hpp/.cpp` (commit 380c4b3), `ShellcodeFile`+`File` RAII read (03f552f), `PeReader` MZ/PE scan class with `PeInfo` snake_case fields + truncated-header bounds fix (ebee2cb).
-- Module rewrite task 3 (in this working tree, uncommitted): `GuestRegion` RAII VirtualAlloc/VirtualFree class (rule of 5, below-4GiB mode for x86 guests) absorbing image/stack/env/heap/thread stacks; `freeLoaded` deleted (regions free themselves); `allocLow` moved into `GuestRegion::allocate`.
+- Module rewrite task 3 (commit 4a15cd7): `GuestRegion` RAII VirtualAlloc/VirtualFree class (rule of 5, below-4GiB mode for x86 guests) absorbing image/stack/env/heap/thread stacks; `freeLoaded` deleted (regions free themselves); `allocLow` moved into `GuestRegion::allocate`.
+- Module rewrite task 4 (commit 2ad6d79): export_resolver split into `api_table` (ApiEntry + checked ApiTable, `add`/`find`, max 32 entries fails closed), `guest_environment` (env layout constants, TEB/PEB/Ldr/fake images, `GuestMem`/`guestMem`/`guestStr`, `buildFakeEnv`) and `api_standins` (all stand-ins + `registerApiStandins`); `GUEST_WRITE` guard macro (local, `#undef` after) replaces 4 repeated guest-copy guards; `Loaded.apis` is `ApiTable`, cores call `l.apis.find(e.ip)`.
+- Module rewrite task 5 (commit 973b1fc): `operand.hpp` (`OperandRegister`/`OperandMemory` tag structs, `Operand` = std::variant) and `instruction_decoder.hpp/.cpp` (Fetch, MR, arch-tagged `decodeMR<Architecture>` via `if constexpr` for the rm==5/mod==0 and SIB base-5 displacement asymmetries, `cond<EmuT>` + `operandRead`/`operandWrite<EmuT>` bound to the core memLd/memSt through ADL, `maskSz`/`bitsSz`/`sext`/`popcnt8` out of line). Both cores' local decode/operand machinery deleted; `Ctx.o`/`Ctx.g` are `Operand`s with `oIsReg`/`oRegIdx`/`oAddr`/`gRegIdx` helpers; `oSet`/`oVal`/`o8Read`/`o8Write` resolve the address then delegate.
 
 ## Part 2 — To implement
 
-Module rewrite tasks 3-7 (conventions = CONTRIBUTING.md; each task: all 4
+Module rewrite tasks 6-7 (conventions = CONTRIBUTING.md; each task: all 4
 msbuild configs built, pytest green in Release AND Debug, one commit).
 
-- Task 3 (finish): build all 4 configs, pytest both, ledger line, commit `refactor: GuestRegion RAII memory regions`.
-- Task 4: user-requested macros for repetitive guard patterns; `GuestEnvironment` + `ApiTable` + `ApiStandins` (replaces export_resolver; checked `apis`/`threads` registries, arch-parameterized layout constants).
-- Task 5: `Operand` (std::variant) + `InstructionDecoder` (shared, arch-tagged) — replaces the malformed `OpRm` clusters.
-- Task 6: `Cpu<Architecture>` template absorbs vm64/vm86 stepwise (a: state/run loop; b: ALU+jcc/call/ret; c: remaining opcodes; d: delete old cores). Lands: rep-string budget fix, `SHELLTERP_BUDGET` env var + budget-fault pytest pin (20-byte `jmp $` → `0xE0000009`), `lookupApi` O(1) range check.
+- Task 6: `Cpu<Architecture>` template absorbs vm64/vm86 stepwise (a: state/run loop; b: ALU+jcc/call/ret; c: remaining opcodes; d: delete old cores). Lands: rep-string budget fix, `SHELLTERP_BUDGET` env var + budget-fault pytest pin (20-byte `jmp $` → `0xE0000009`), O(1) stand-in lookup.
 - Task 7: `ThreadContext` + RAII audit + `main` sweep; vcxproj updated, old files deleted; README exit/fault code table.
 
 Feature track after the rewrite:
