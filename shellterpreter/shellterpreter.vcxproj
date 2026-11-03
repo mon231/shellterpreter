@@ -125,6 +125,7 @@
     <ClCompile Include="vm86.cpp" />
     <ClCompile Include="audit.cpp" />
     <ClCompile Include="fault.cpp" />
+    <ClCompile Include="shellcode_file.cpp" />
     <ClInclude Include="fault.hpp" />
   </ItemGroup>
   <ItemGroup>

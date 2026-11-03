@@ -8,6 +8,7 @@
 #include "vm.hpp"
 #include "audit.hpp"
 #include "export_resolver.hpp"
+#include "shellcode_file.hpp"
 
 namespace stub {
 
@@ -21,21 +22,9 @@ void freeLoaded(Loaded& l) {
 }
 
 uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return fault_code(Fault::BadFile);
-    DWORD hi = 0;
-    const DWORD lo = GetFileSize(h, &hi);
-    if (lo == INVALID_FILE_SIZE && hi != 0) { CloseHandle(h); return fault_code(Fault::BadFile); }
-    std::vector<uint8_t> data;
-    data.resize(static_cast<size_t>((static_cast<uint64_t>(hi) << 32) | lo));
-    DWORD got = 0;
-    if (!ReadFile(h, data.data(), static_cast<DWORD>(data.size()), &got, nullptr) ||
-        got != data.size() || data.empty()) {
-        CloseHandle(h);
-        return fault_code(Fault::BadFile);
-    }
-    CloseHandle(h);
+    ShellcodeFile file;
+    if (!file.open(path)) return fault_code(Fault::BadFile);
+    const std::vector<uint8_t>& data = file.bytes();
 
     uint64_t imgOff = 0;
     uint16_t machine = 0;
