@@ -6,7 +6,7 @@
 
 namespace stub {
 
-// Env layout (RVAs from l.envBase). Nodes are 0x100 apart so both layouts
+// Env layout (RVAs from l.env.base()). Nodes are 0x100 apart so both layouts
 // overlap: x86 node.DllBase at +0x10, x64 at +0x20.
 //   0x100  TEB   (fsBase/gsBase)          0x200  PEB
 //   0x300  Ldr                            0x400  chain node1 (head)
@@ -63,37 +63,26 @@ constexpr uint32_t MSVCRT_RVA  = 0x1E00;
 constexpr uint32_t CRTRT_RVA   = 0x1F00;
 }
 
-void* allocLow(size_t sz) {
-    // x86 core addresses everything through 32-bit registers/pointers; keep all
-    // regions below 4 GB even in a 64-bit process
-    for (uintptr_t a = 0x10000; a < 0x80000000ull; a += 0x10000) {
-        void* p = VirtualAlloc(reinterpret_cast<void*>(a), sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (p) return p;
-    }
-    return VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-}
-
 // Guest memory view over any mapped guest region (image, stack, env, heap and
 // each thread's own stack). Returns a host pointer and the bytes remaining
 // from addr to the end of that region; null if addr is outside guest memory.
 struct GuestMem { uint8_t* p; size_t avail; };
+
+static GuestMem hit(const GuestRegion& region, uint64_t addr, size_t n) {
+    if (region.empty() || addr < region.base() || addr - region.base() >= region.size())
+        return { nullptr, 0 };
+    const size_t off = static_cast<size_t>(addr - region.base());
+    if (off + n > region.size()) return { nullptr, 0 };
+    return { region.data() + off, static_cast<size_t>(region.size() - off) };
+}
+
 static GuestMem guestMem(const Loaded& l, uint64_t addr) {
-    auto hit = [](uint8_t* base, uint64_t b, size_t len,
-                  uint64_t a, size_t n) -> GuestMem {
-        if (!base || a < b || a - b >= len) return { nullptr, 0 };
-        const size_t off = static_cast<size_t>(a - b);
-        if (off + n > len) return { nullptr, 0 };
-        return { base + off, len - off };
-    };
-    if (auto m = hit(l.img, l.imgBase, l.imgLen, addr, 1); m.p) return m;
-    if (auto m = hit(l.stk, l.stkBase, l.stkLen, addr, 1); m.p) return m;
-    if (auto m = hit(l.env, l.envBase, l.envLen, addr, 1); m.p) return m;
-    const uint64_t heapBase = reinterpret_cast<uint64_t>(l.heap);
-    const size_t heapLen = static_cast<size_t>(l.heapEnd - heapBase);
-    if (auto m = hit(l.heap, heapBase, heapLen, addr, 1); m.p) return m;
+    if (auto m = hit(l.img, addr, 1); m.p) return m;
+    if (auto m = hit(l.stk, addr, 1); m.p) return m;
+    if (auto m = hit(l.env, addr, 1); m.p) return m;
+    if (auto m = hit(l.heap, addr, 1); m.p) return m;
     for (uint32_t i = 0; i < l.threadCount; ++i) {
-        if (auto m = hit(l.threads[i].stack, l.threads[i].stackBase,
-                         l.threads[i].stackLen, addr, 1); m.p) return m;
+        if (auto m = hit(l.threads[i].stack, addr, 1); m.p) return m;
     }
     return { nullptr, 0 };
 }
@@ -124,7 +113,7 @@ static bool nameEq(const char* a, const char* b) {
 }
 
 // ordinal import: stubs mask ordinals with 0xffff, so any value < 0x10000 is an
-// ordinal; name pointers are absolute and >= imgBase (>= 0x10000 by allocLow)
+// ordinal; name pointers are absolute and >= img.base() (VirtualAlloc reserves start at 0x10000)
 static const uint64_t kOrdinalMax = 0x10000ull;
 
 static bool startsWithNoCase(const char* s, const char* prefix) {
@@ -137,17 +126,17 @@ static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
     char name[64];
     if (!guestStr(l, args[0], name)) return 0;
     if (nameEq(name, "kernel32.dll") || nameEq(name, "kernelbase.dll")) {
-        return l.envBase + K32_RVA;
+        return l.env.base() + K32_RVA;
     }
-    if (nameEq(name, "user32.dll")) return l.envBase + USER32_RVA;
-    if (nameEq(name, "msvcrt.dll")) return l.envBase + MSVCRT_RVA;
+    if (nameEq(name, "user32.dll")) return l.env.base() + USER32_RVA;
+    if (nameEq(name, "msvcrt.dll")) return l.env.base() + MSVCRT_RVA;
     // the CRT is split over ucrtbase/msvcp140/vcruntime140 and api-set stubs,
     // with a "d" suffix in Debug builds (msvcp140d, ucrtbased, ...)
     if (startsWithNoCase(name, "ucrtbase") || startsWithNoCase(name, "ucrtbased") ||
         startsWithNoCase(name, "msvcp140") ||
         startsWithNoCase(name, "vcruntime140") ||
         startsWithNoCase(name, "api-ms-win-crt-")) {
-        return l.envBase + CRTRT_RVA;
+        return l.env.base() + CRTRT_RVA;
     }
     return 0;
 }
@@ -156,46 +145,46 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (args[1] < kOrdinalMax) return 0; // ordinal imports not emulated
     char name[64];
     if (!guestStr(l, args[1], name)) return 0;
-    if (nameEq(name, "LoadLibraryA"))  return l.envBase + ST_LL_A;
-    if (nameEq(name, "GetProcAddress")) return l.envBase + ST_GP_A;
-    if (nameEq(name, "MessageBoxA"))   return l.envBase + ST_MB_A;
-    if (nameEq(name, "printf"))        return l.envBase + ST_PRINTF_A;
-    if (nameEq(name, "srand"))         return l.envBase + ST_SRAND_A;
-    if (nameEq(name, "rand"))          return l.envBase + ST_RAND_A;
-    if (nameEq(name, "FindResourceA")) return l.envBase + ST_FIND_RES_A;
-    if (nameEq(name, "SizeofResource")) return l.envBase + ST_SIZE_RES_A;
-    if (nameEq(name, "_beginthreadex")) return l.envBase + ST_BEGINT;
-    if (nameEq(name, "_Thrd_join"))     return l.envBase + ST_THRDJOIN;
-    if (nameEq(name, "_Thrd_id"))       return l.envBase + ST_THRDID;
-    if (nameEq(name, "GetCurrentThreadId")) return l.envBase + ST_THRDID;
-    if (nameEq(name, "_Cnd_do_broadcast_at_thread_exit")) return l.envBase + ST_CNDEXIT;
-    if (nameEq(name, "malloc"))         return l.envBase + ST_MALLOC;
-    if (nameEq(name, "free"))           return l.envBase + ST_FREE;
-    if (nameEq(name, "_callnewh"))      return l.envBase + ST_CALLNEWH;
+    if (nameEq(name, "LoadLibraryA"))  return l.env.base() + ST_LL_A;
+    if (nameEq(name, "GetProcAddress")) return l.env.base() + ST_GP_A;
+    if (nameEq(name, "MessageBoxA"))   return l.env.base() + ST_MB_A;
+    if (nameEq(name, "printf"))        return l.env.base() + ST_PRINTF_A;
+    if (nameEq(name, "srand"))         return l.env.base() + ST_SRAND_A;
+    if (nameEq(name, "rand"))          return l.env.base() + ST_RAND_A;
+    if (nameEq(name, "FindResourceA")) return l.env.base() + ST_FIND_RES_A;
+    if (nameEq(name, "SizeofResource")) return l.env.base() + ST_SIZE_RES_A;
+    if (nameEq(name, "_beginthreadex")) return l.env.base() + ST_BEGINT;
+    if (nameEq(name, "_Thrd_join"))     return l.env.base() + ST_THRDJOIN;
+    if (nameEq(name, "_Thrd_id"))       return l.env.base() + ST_THRDID;
+    if (nameEq(name, "GetCurrentThreadId")) return l.env.base() + ST_THRDID;
+    if (nameEq(name, "_Cnd_do_broadcast_at_thread_exit")) return l.env.base() + ST_CNDEXIT;
+    if (nameEq(name, "malloc"))         return l.env.base() + ST_MALLOC;
+    if (nameEq(name, "free"))           return l.env.base() + ST_FREE;
+    if (nameEq(name, "_callnewh"))      return l.env.base() + ST_CALLNEWH;
     // throw helpers are resolved but only a guest raising an exception reaches
     // them; that is not emulated yet, so they fail closed instead of returning
-    if (nameEq(name, "_CxxThrowException")) return l.envBase + ST_CRTFAIL;
-    if (nameEq(name, "__std_exception_copy")) return l.envBase + ST_CRTFAIL;
-    if (nameEq(name, "__std_exception_destroy")) return l.envBase + ST_CRTFAIL;
-    if (nameEq(name, "?_Throw_Cpp_error@std@@YAXH@Z")) return l.envBase + ST_CRTFAIL;
-    if (nameEq(name, "terminate")) return l.envBase + ST_CRTFAIL;
-    if (nameEq(name, "GetSystemTimeAsFileTime")) return l.envBase + ST_GSFT;
-    if (nameEq(name, "QueryPerformanceCounter")) return l.envBase + ST_QPC;
-    if (nameEq(name, "GetCurrentProcessId")) return l.envBase + ST_PID;
-    if (nameEq(name, "InitializeSListHead")) return l.envBase + ST_SLIST;
-    if (nameEq(name, "UnhandledExceptionFilter")) return l.envBase + ST_UEHF;
-    if (nameEq(name, "SetUnhandledExceptionFilter")) return l.envBase + ST_SUEH;
-    if (nameEq(name, "IsProcessorFeaturePresent")) return l.envBase + ST_IPP;
+    if (nameEq(name, "_CxxThrowException")) return l.env.base() + ST_CRTFAIL;
+    if (nameEq(name, "__std_exception_copy")) return l.env.base() + ST_CRTFAIL;
+    if (nameEq(name, "__std_exception_destroy")) return l.env.base() + ST_CRTFAIL;
+    if (nameEq(name, "?_Throw_Cpp_error@std@@YAXH@Z")) return l.env.base() + ST_CRTFAIL;
+    if (nameEq(name, "terminate")) return l.env.base() + ST_CRTFAIL;
+    if (nameEq(name, "GetSystemTimeAsFileTime")) return l.env.base() + ST_GSFT;
+    if (nameEq(name, "QueryPerformanceCounter")) return l.env.base() + ST_QPC;
+    if (nameEq(name, "GetCurrentProcessId")) return l.env.base() + ST_PID;
+    if (nameEq(name, "InitializeSListHead")) return l.env.base() + ST_SLIST;
+    if (nameEq(name, "UnhandledExceptionFilter")) return l.env.base() + ST_UEHF;
+    if (nameEq(name, "SetUnhandledExceptionFilter")) return l.env.base() + ST_SUEH;
+    if (nameEq(name, "IsProcessorFeaturePresent")) return l.env.base() + ST_IPP;
     // CRT startup pieces: iterations ran without them so far because the peor
     // stub chain takes EXE tests straight to main; a DLL entry runs the real
     // _DllMainCRTStartup flow and needs these
-    if (nameEq(name, "__C_specific_handler")) return l.envBase + ST_CSH;
-    if (nameEq(name, "GetCurrentProcess")) return l.envBase + ST_GCURPROC;
+    if (nameEq(name, "__C_specific_handler")) return l.env.base() + ST_CSH;
+    if (nameEq(name, "GetCurrentProcess")) return l.env.base() + ST_GCURPROC;
     // never legitimate mid-run: fail closed
-    if (nameEq(name, "TerminateProcess")) return l.envBase + ST_TERMPROC;
-    if (nameEq(name, "_except_handler4_common")) return l.envBase + ST_EH4;
-    if (nameEq(name, "memcpy")) return l.envBase + ST_MEMCPY;
-    if (nameEq(name, "memset")) return l.envBase + ST_MEMSET;
+    if (nameEq(name, "TerminateProcess")) return l.env.base() + ST_TERMPROC;
+    if (nameEq(name, "_except_handler4_common")) return l.env.base() + ST_EH4;
+    if (nameEq(name, "memcpy")) return l.env.base() + ST_MEMCPY;
+    if (nameEq(name, "memset")) return l.env.base() + ST_MEMSET;
     if (nameEq(name, "_cexit") ||
         nameEq(name, "_execute_onexit_table") ||
         nameEq(name, "_initialize_onexit_table") ||
@@ -208,12 +197,12 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
         // real C++ static initializers (ctors in __xc_a) will need a run-loop
         // driven version, upgrade in iteration 6 alongside exception tests
         nameEq(name, "_initterm") ||
-        nameEq(name, "_initterm_e")) return l.envBase + ST_CNOP;
+        nameEq(name, "_initterm_e")) return l.env.base() + ST_CNOP;
     // Rtl unwind/context never legitimately run before exception support;
     // fail closed instead of silently returning zeros
     if (nameEq(name, "RtlCaptureContext") ||
         nameEq(name, "RtlLookupFunctionEntry") ||
-        nameEq(name, "RtlVirtualUnwind")) return l.envBase + ST_CRTFAIL;
+        nameEq(name, "RtlVirtualUnwind")) return l.env.base() + ST_CRTFAIL;
     return 0;
 }
 
@@ -309,7 +298,7 @@ static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
             continue;
         }
         // arguments at our call sites are 32-bit values; all guest pointers
-        // fit below 4 GB (allocLow keeps every region under 0x80000000)
+        // fit below 4 GB (GuestRegion keeps every guest block under 0x80000000)
         const uint64_t v = args[argIdx++] & 0xFFFFFFFFull;
         if (spec == 's') {
             char s[64];
@@ -345,9 +334,9 @@ static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
 // so FindResourceA/SizeofResource walk its real resource directory
 static bool imgRead(const Loaded& l, uint64_t off, void* dst, size_t n) {
     if (!l.hasImage) return false;
-    const uint64_t avail = l.imgLen > l.pe.image_offset ? l.imgLen - l.pe.image_offset : 0;
+    const uint64_t avail = l.img.size() > l.pe.image_offset ? l.img.size() - l.pe.image_offset : 0;
     if (off > avail || n > avail - off) return false;
-    memcpy(dst, l.img + l.pe.image_offset + off, n);
+    memcpy(dst, l.img.data() + l.pe.image_offset + off, n);
     return true;
 }
 
@@ -427,11 +416,11 @@ static uint64_t apiFindResourceA(Loaded& l, const uint64_t* args) {
         if (!resFirst(l, res, nameRel, langRel, dir) || dir) return 0; // any language
     }
     // handle = guest address of the data entry, decoded again by SizeofResource
-    return l.imgBase + l.pe.image_offset + res + langRel;
+    return l.img.base() + l.pe.image_offset + res + langRel;
 }
 
 static uint64_t apiSizeofResource(Loaded& l, const uint64_t* args) {
-    const uint64_t imageGuest = l.imgBase + l.pe.image_offset;
+    const uint64_t imageGuest = l.img.base() + l.pe.image_offset;
     if (args[1] < imageGuest) return 0;
     // IMAGE_RESOURCE_DATA_ENTRY: DataRVA, Size, CodePage, Reserved
     uint32_t size = 0;
@@ -444,19 +433,15 @@ static uint64_t apiBeginThread(Loaded& l, const uint64_t* args) {
     // The thread is not run here: runThread is triggered by the first join or
     // wait for it, which keeps the interpreter single-threaded internally.
     if (l.threadCount >= 8) return 0;
-    size_t stackSize = static_cast<size_t>(args[1]);
+    uint64_t stackSize = static_cast<uint64_t>(args[1]);
     if (stackSize < 0x4000) stackSize = 0x40000; // default-ish, generous
     if (stackSize > 0x400000) stackSize = 0x400000;
-    void* stk = allocLow(stackSize);
-    if (!stk) return 0;
     ThreadCtx& t = l.threads[l.threadCount];
     t = ThreadCtx{};
+    if (!t.stack.allocate(stackSize, true)) return 0;
     t.handle = 0x400ull + l.threadCount;
     t.entry = args[2];
     t.arg = args[3];
-    t.stack = static_cast<uint8_t*>(stk);
-    t.stackBase = reinterpret_cast<uint64_t>(stk);
-    t.stackLen = stackSize;
     t.done = false;
     t.exitCode = 0;
     ++l.threadCount;
@@ -531,25 +516,19 @@ static uint64_t apiCrtFail(Loaded& l, const uint64_t*) {
 }
 
 uint32_t buildFakeEnv(Loaded& l) {
-    constexpr size_t kEnv = 0x2000;
-    void* p = allocLow(kEnv);
-    if (!p) return fault_code(Fault::Allocation);
-    uint8_t* m = static_cast<uint8_t*>(p);
-    l.env = m;
-    l.envLen = kEnv;
-    l.envBase = reinterpret_cast<uint64_t>(m);
+    constexpr uint64_t kEnvSize = 0x2000;
+    if (!l.env.allocate(kEnvSize, true)) return fault_code(Fault::Allocation);
+    uint8_t* m = l.env.data();
     auto put32 = [m](uint32_t off, uint32_t v) { memcpy(m + off, &v, 4); };
     auto put16 = [m](uint32_t off, uint16_t v) { memcpy(m + off, &v, 2); };
-    const uint32_t B = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m));
-    l.fsBase = l.envBase + 0x100;
-    l.gsBase = l.envBase + 0x100;
+    const uint32_t B = static_cast<uint32_t>(l.env.base());
+    l.fsBase = l.env.base() + 0x100;
+    l.gsBase = l.env.base() + 0x100;
 
     // guest heap: bump allocator for std::thread's operator new (malloc) and
     // any other dynamic allocation; freed only on process exit
-    void* hp = allocLow(0x100000);
-    if (!hp) return fault_code(Fault::Allocation);
-    l.heap = static_cast<uint8_t*>(hp);
-    l.heapNext = reinterpret_cast<uint64_t>(hp);
+    if (!l.heap.allocate(0x100000, true)) return fault_code(Fault::Allocation);
+    l.heapNext = l.heap.base();
     l.heapEnd = l.heapNext + 0x100000;
     l.threadCount = 0;
     l.fault = fault_code(Fault::None);
@@ -563,7 +542,7 @@ uint32_t buildFakeEnv(Loaded& l) {
     put32(0x620, B + K32_RVA);    // node3 DllBase, x64
 
     // fake kernel32 image: stubs read the export directory through the PE
-    // header at [imgBase+0x3C]; x86 dir RVA at pehdr+0x78, x64 at +0x88
+    // header at [img.base()+0x3C]; x86 dir RVA at pehdr+0x78, x64 at +0x88
     m[K32_RVA] = 'M'; m[K32_RVA + 1] = 'Z';
     put32(K32_RVA + 0x3C, 0x40);
     m[K32_RVA + 0x40] = 'P'; m[K32_RVA + 0x41] = 'E'; m[K32_RVA + 0x42] = 0; m[K32_RVA + 0x43] = 0;

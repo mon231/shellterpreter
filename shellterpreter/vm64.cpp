@@ -81,18 +81,18 @@ inline uint64_t doNegOp(Emu& e, int sz, uint64_t a) {
 }
 
 template <class T> uint8_t* addrPtr(Emu& e, uint64_t addr) {
-    if (addr >= e.l->imgBase && addr + sizeof(T) <= e.imgEnd)
-        return e.l->img + (addr - e.l->imgBase);
-    if (addr >= e.l->stkBase && addr + sizeof(T) <= e.l->stkBase + e.l->stkLen)
-        return e.l->stk + (addr - e.l->stkBase);
+    if (addr >= e.l->img.base() && addr + sizeof(T) <= e.imgEnd)
+        return e.l->img.data() + (addr - e.l->img.base());
+    if (addr >= e.l->stk.base() && addr + sizeof(T) <= e.l->stk.base() + e.l->stk.size())
+        return e.l->stk.data() + (addr - e.l->stk.base());
     if (addr >= e.envBase && addr + sizeof(T) <= e.envEnd)
-        return e.l->env + (addr - e.envBase);
-    const uint64_t heapBase = reinterpret_cast<uint64_t>(e.l->heap);
-    if (heapBase && addr >= heapBase && addr + sizeof(T) <= e.l->heapEnd)
-        return e.l->heap + (addr - heapBase);
+        return e.l->env.data() + (addr - e.envBase);
+    if (addr >= e.l->heap.base() && addr + sizeof(T) <= e.l->heapEnd)
+        return e.l->heap.data() + (addr - e.l->heap.base());
     for (uint32_t i = 0; i < e.l->threadCount; ++i) {
-        if (addr >= e.l->threads[i].stackBase && addr + sizeof(T) <= e.l->threads[i].stackBase + e.l->threads[i].stackLen)
-            return e.l->threads[i].stack + (addr - e.l->threads[i].stackBase);
+        const GuestRegion& stack = e.l->threads[i].stack;
+        if (addr >= stack.base() && addr + sizeof(T) <= stack.base() + stack.size())
+            return stack.data() + (addr - stack.base());
     }
     return nullptr;
 }
@@ -255,7 +255,7 @@ struct Ctx {
     uint64_t eaCalc() {
         uint64_t ea = 0;
         if (mr.ripRel) {
-            ea = l.imgBase + f.pos + mr.disp;
+            ea = l.img.base() + f.pos + mr.disp;
         } else if (mr.hasSib) {
             ea = 0;
             if (!(mr.sibBase == 5 && mr.mod == 0)) ea += e.r[mr.sibBase | (rexB << 3)];
@@ -555,7 +555,7 @@ uint32_t step(Ctx& c) {
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
     case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F: {
         const int8_t rel = static_cast<int8_t>(f.u8());
-        const uint64_t nxt = c.l.imgBase + f.pos;
+        const uint64_t nxt = c.l.img.base() + f.pos;
         c.ipSet = true;
         c.e.ip = cond(c.e, op & 0xF) ? nxt + static_cast<uint64_t>(rel) : nxt;
         return fault_code(Fault::None);
@@ -875,14 +875,14 @@ uint32_t step(Ctx& c) {
         return fault_code(Fault::UnsupportedInstruction);
     case 0xEB: {
         const int8_t rel = static_cast<int8_t>(f.u8());
-        const uint64_t nxt = c.l.imgBase + f.pos;
+        const uint64_t nxt = c.l.img.base() + f.pos;
         c.ipSet = true;
         c.e.ip = nxt + static_cast<uint64_t>(rel);
         return fault_code(Fault::None);
     }
     case 0xE8: {
         const uint32_t rel = f.u32();
-        const uint64_t nxt = c.l.imgBase + f.pos + 0;
+        const uint64_t nxt = c.l.img.base() + f.pos + 0;
         if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory);
         c.ipSet = true;
         c.e.ip = nxt + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(rel)));
@@ -890,7 +890,7 @@ uint32_t step(Ctx& c) {
     }
     case 0xE9: {
         const uint32_t rel = f.u32();
-        const uint64_t nxt = c.l.imgBase + f.pos;
+        const uint64_t nxt = c.l.img.base() + f.pos;
         c.ipSet = true;
         c.e.ip = nxt + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(rel)));
         return fault_code(Fault::None);
@@ -899,7 +899,7 @@ uint32_t step(Ctx& c) {
         return fault_code(Fault::UnsupportedInstruction);
     case 0xE0: case 0xE1: case 0xE2: case 0xE3: {
         const int8_t rel = static_cast<int8_t>(f.u8());
-        const uint64_t nxt = c.l.imgBase + f.pos;
+        const uint64_t nxt = c.l.img.base() + f.pos;
         uint64_t rcx = c.e.r[1];
         bool take = false;
         if (op == 0xE3) take = (rcx == 0);
@@ -1055,7 +1055,7 @@ uint32_t step(Ctx& c) {
         if (kind == 2 || kind == 4) {
             const uint64_t a = c.oVal(8);
             if (c.fault != fault_code(Fault::None)) return c.fault;
-            const uint64_t nxt = c.l.imgBase + f.pos;
+            const uint64_t nxt = c.l.img.base() + f.pos;
             if (kind == 2) { if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory); }
             c.ipSet = true;
             c.e.ip = a;
@@ -1150,7 +1150,7 @@ uint32_t step(Ctx& c) {
         case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
         case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E: case 0x8F: {
             const uint32_t rel = f.u32();
-            const uint64_t nxt = c.l.imgBase + f.pos;
+            const uint64_t nxt = c.l.img.base() + f.pos;
             c.ipSet = true;
             c.e.ip = cond(c.e, op2 & 0xF) ? nxt + rel : nxt;
             return fault_code(Fault::None);
@@ -1279,13 +1279,13 @@ static uint32_t runLoop(Emu& e) {
         }
         if (e.budget == 0) return fault_code(Fault::Budget);
         --e.budget;
-        if (e.ip < l.imgBase || e.ip >= e.imgEnd) {
+        if (e.ip < l.img.base() || e.ip >= e.imgEnd) {
             fprintf(stderr, "instruction fetch outside image: ip=0x%llX (off=0x%llX)\n",
                     (unsigned long long)e.ip,
-                    (unsigned long long)(e.ip - l.imgBase));
+                    (unsigned long long)(e.ip - l.img.base()));
             return fault_code(Fault::OutsideMemory);
         }
-        Fetch f{l.img, l.imgLen, static_cast<size_t>(e.ip - l.imgBase)};
+        Fetch f{l.img.data(), l.img.size(), static_cast<size_t>(e.ip - l.img.base())};
         Ctx c{e, l, f, e.ip};
         const uint32_t r = stepOne(c);
         if (r != fault_code(Fault::None)) {
@@ -1297,7 +1297,7 @@ static uint32_t runLoop(Emu& e) {
             return r;
         }
         if (!c.ipSet) {
-            e.ip = c.l.imgBase + f.pos;
+            e.ip = c.l.img.base() + f.pos;
         }
     }
     return fault_code(Fault::None);
@@ -1306,22 +1306,22 @@ static uint32_t runLoop(Emu& e) {
 uint32_t run64(Loaded& l) {
     Emu e;
     e.l = &l;
-    e.imgEnd = l.imgBase + l.imgLen;
-    e.stkEnd = l.stkBase + l.stkLen;
+    e.imgEnd = l.img.base() + l.img.size();
+    e.stkEnd = l.stk.base() + l.stk.size();
     e.fsBase = l.fsBase;
     e.gsBase = l.gsBase;
-    e.envBase = l.envBase;
-    e.envEnd = l.envBase + l.envLen;
+    e.envBase = l.env.base();
+    e.envEnd = l.env.base() + l.env.size();
 
     // leave 0x100 bytes above the initial rsp: stand-in interception may peek
     // at unused vararg slots, and reads must stay inside the region
     e.r[kRSP] = e.stkEnd - 8 - 0x100;
     if (!memSt<uint64_t>(e, e.r[kRSP], kSentinel)) return fault_code(Fault::OutsideMemory);
-    e.ip = l.imgBase;
+    e.ip = l.img.base();
     if (l.pe.is_dll) {
         // DLL entry signature: DllMain(hinst, DLL_PROCESS_ATTACH, nullptr);
         // hinst = guest address of the image's PE header
-        e.r[1] = l.imgBase + l.pe.image_offset;
+        e.r[1] = l.img.base() + l.pe.image_offset;
         e.r[2] = 1;
         e.r[3] = 0;
     }
@@ -1334,12 +1334,12 @@ uint32_t run64(Loaded& l) {
 uint32_t runThread64(Loaded& l, ThreadCtx& t) {
     Emu e;
     e.l = &l;
-    e.imgEnd = l.imgBase + l.imgLen;
-    e.stkEnd = t.stackBase + t.stackLen;
+    e.imgEnd = l.img.base() + l.img.size();
+    e.stkEnd = t.stack.base() + t.stack.size();
     e.fsBase = l.fsBase;
     e.gsBase = l.gsBase;
-    e.envBase = l.envBase;
-    e.envEnd = l.envBase + l.envLen;
+    e.envBase = l.env.base();
+    e.envEnd = l.env.base() + l.env.size();
 
     // entry state of a real thread start: sentinel return address on top,
     // thread argument in the first argument register

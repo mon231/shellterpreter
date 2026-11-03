@@ -5,6 +5,7 @@
 #include <vector>
 #include "fault.hpp"
 #include "pe_reader.hpp"
+#include "guest_region.hpp"
 
 namespace stub {
 
@@ -31,32 +32,24 @@ struct ThreadCtx {
     uint64_t handle;
     uint64_t entry;
     uint64_t arg;
-    uint8_t* stack;
-    uint64_t stackBase;
-    size_t   stackLen;
+    GuestRegion stack;
     uint32_t exitCode;
     bool     done;
 };
 
 struct Loaded {
-    uint8_t* img;
-    size_t   imgLen;
-    uint64_t imgBase;
-    uint8_t* stk;
-    size_t   stkLen;
-    uint64_t stkBase;
+    GuestRegion img;   // the whole mapped blob: image bytes + header + slack
+    GuestRegion stk;
+    GuestRegion env;
+    GuestRegion heap;
     uint64_t fsBase;
     uint64_t gsBase;
-    uint8_t* env;
-    size_t   envLen;
-    uint64_t envBase;
+    uint64_t heapNext;  // bump allocator cursor inside heap
+    uint64_t heapEnd;
     ApiEntry apis[32];
     uint32_t apiCount;
     ThreadCtx threads[8];
     uint32_t threadCount;
-    uint8_t* heap;
-    uint64_t heapNext;
-    uint64_t heapEnd;
     uint32_t fault; // stand-in sets this to fail closed
     PeInfo   pe;
     bool     is64;
@@ -68,8 +61,6 @@ inline const ApiEntry* lookupApi(const Loaded& l, uint64_t ip) {
         if (l.apis[i].addr == ip) return &l.apis[i];
     return nullptr;
 }
-
-void freeLoaded(Loaded& l);
 
 // Returns fault_code(Fault::BadFile) when the file cannot be read or is empty. Detection
 // of an embedded PE header is optional; when none is found the buffer starts
