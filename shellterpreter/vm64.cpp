@@ -1262,7 +1262,7 @@ static uint32_t runLoop(Emu& e) {
     Loaded& l = *e.l;
     for (;;) {
         if (e.ip == kSentinel) break;
-        if (const ApiEntry* api = lookupApi(l, e.ip)) {
+        if (const ApiEntry* api = l.apis.find(e.ip)) {
             // compiled-in stand-in: x64 ABI, caller cleans stack
             uint64_t ret = 0;
             if (!memLd<uint64_t>(e, e.r[kRSP], ret)) return fault_code(Fault::OutsideMemory);

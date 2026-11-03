@@ -1,105 +1,9 @@
-#include "export_resolver.hpp"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "api_standins.hpp"
+#include "guest_environment.hpp"
 #include <cstdio>
 #include <cstring>
 
 namespace stub {
-
-// Env layout (RVAs from l.env.base()). Nodes are 0x100 apart so both layouts
-// overlap: x86 node.DllBase at +0x10, x64 at +0x20.
-//   0x100  TEB   (fsBase/gsBase)          0x200  PEB
-//   0x300  Ldr                            0x400  chain node1 (head)
-//   0x500  chain node2 = ntdll            0x600  chain node3 = kernel32
-//   0x800  fake kernel32 image            0x1000 fake ntdll image
-//   0xA00  LoadLibraryA stand-in          0xA10  GetProcAddress stand-in
-//   0x1010 RtlAdd* stand-in               0x1C00 MessageBoxA stand-in
-//   0x1D00 printf stand-in                0x1D10 srand stand-in
-//   0x1D20 rand stand-in                  0x1E00 fake msvcrt module handle (no image)
-//   0x1D30 FindResourceA stand-in         0x1D40 SizeofResource stand-in
-//   0x1D50 _beginthreadex stand-in        0x1D60 _Thrd_join stand-in
-//   0x1D70 _Thrd_id stand-in              0x1D80 _Cnd_do_broadcast_at_thread_exit
-//   0x1D90 malloc stand-in                0x1DA0 free stand-in
-//   0x1DB0 _callnewh stand-in             0x1DC0 fail-closed CRT helper
-//   0x1F00 fake CRT/MSVC module handle (ucrt/msvcp/vcruntime/api-set, no image)
-//   0x1800 fake user32 module handle (no image; GetProcAddress never walks it)
-namespace {
-constexpr uint32_t K32_RVA    = 0x800;
-constexpr uint32_t USER32_RVA = 0x1800;
-constexpr uint32_t NTDLL_RVA  = 0x1000;
-constexpr uint32_t ST_LL_A    = 0xA00;
-constexpr uint32_t ST_GP_A    = 0xA10;
-constexpr uint32_t ST_MB_A    = 0x1C00;
-constexpr uint32_t ST_NT_A    = 0x1010;
-constexpr uint32_t ST_PRINTF_A = 0x1D00;
-constexpr uint32_t ST_SRAND_A  = 0x1D10;
-constexpr uint32_t ST_RAND_A   = 0x1D20;
-constexpr uint32_t ST_FIND_RES_A = 0x1D30;
-constexpr uint32_t ST_SIZE_RES_A = 0x1D40;
-constexpr uint32_t ST_BEGINT   = 0x1D50;
-constexpr uint32_t ST_THRDJOIN = 0x1D60;
-constexpr uint32_t ST_THRDID   = 0x1D70;
-constexpr uint32_t ST_CNDEXIT  = 0x1D80;
-constexpr uint32_t ST_MALLOC   = 0x1D90;
-constexpr uint32_t ST_FREE     = 0x1DA0;
-constexpr uint32_t ST_CALLNEWH = 0x1DB0;
-constexpr uint32_t ST_CRTFAIL  = 0x1DC0;
-constexpr uint32_t ST_CSH      = 0x1DD0; // __C_specific_handler stub
-constexpr uint32_t ST_MEMCPY   = 0x1DE0;
-constexpr uint32_t ST_CNOP     = 0x1DF0; // shared cdecl no-op (uCRT startup)
-constexpr uint32_t ST_MEMSET   = 0x1DF8;
-constexpr uint32_t ST_GCURPROC = 0x1E00; // GetCurrentProcess
-constexpr uint32_t ST_TERMPROC = 0x1E08; // TerminateProcess
-constexpr uint32_t ST_EH4      = 0x1E10; // _except_handler4_common
-// kernel32 slack (no export data below 0x1000): CRT-startup API stand-ins
-constexpr uint32_t ST_GSFT   = 0xC00; // GetSystemTimeAsFileTime
-constexpr uint32_t ST_QPC    = 0xC10; // QueryPerformanceCounter
-constexpr uint32_t ST_PID    = 0xC20; // GetCurrentProcessId
-constexpr uint32_t ST_SLIST  = 0xC30; // InitializeSListHead
-constexpr uint32_t ST_UEHF   = 0xC40; // UnhandledExceptionFilter
-constexpr uint32_t ST_SUEH   = 0xC50; // SetUnhandledExceptionFilter
-constexpr uint32_t ST_IPP    = 0xC60; // IsProcessorFeaturePresent
-constexpr uint32_t MSVCRT_RVA  = 0x1E00;
-constexpr uint32_t CRTRT_RVA   = 0x1F00;
-}
-
-// Guest memory view over any mapped guest region (image, stack, env, heap and
-// each thread's own stack). Returns a host pointer and the bytes remaining
-// from addr to the end of that region; null if addr is outside guest memory.
-struct GuestMem { uint8_t* p; size_t avail; };
-
-static GuestMem hit(const GuestRegion& region, uint64_t addr, size_t n) {
-    if (region.empty() || addr < region.base() || addr - region.base() >= region.size())
-        return { nullptr, 0 };
-    const size_t off = static_cast<size_t>(addr - region.base());
-    if (off + n > region.size()) return { nullptr, 0 };
-    return { region.data() + off, static_cast<size_t>(region.size() - off) };
-}
-
-static GuestMem guestMem(const Loaded& l, uint64_t addr) {
-    if (auto m = hit(l.img, addr, 1); m.p) return m;
-    if (auto m = hit(l.stk, addr, 1); m.p) return m;
-    if (auto m = hit(l.env, addr, 1); m.p) return m;
-    if (auto m = hit(l.heap, addr, 1); m.p) return m;
-    for (uint32_t i = 0; i < l.threadCount; ++i) {
-        if (auto m = hit(l.threads[i].stack, addr, 1); m.p) return m;
-    }
-    return { nullptr, 0 };
-}
-
-static bool guestStr(const Loaded& l, uint64_t addr, char out[64]) {
-    GuestMem m = guestMem(l, addr);
-    if (!m.p) return false;
-    size_t n = 0;
-    while (n < 63 && n < m.avail) {
-        const char c = static_cast<char>(m.p[n]);
-        out[n] = c;
-        if (c == '\0') return true;
-        ++n;
-    }
-    out[63] = '\0';
-    return true;
-}
 
 static char lowerAscii(char c) {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
@@ -121,6 +25,12 @@ static bool startsWithNoCase(const char* s, const char* prefix) {
         if (lowerAscii(*s) != lowerAscii(*prefix)) return false;
     return true;
 }
+
+// copy `size` bytes to a guest address when the bytes are mapped
+#define GUEST_WRITE(l, addr, from, size) do { \
+        GuestMem m_ = guestMem((l), (addr)); \
+        if (m_.p && m_.avail >= (size)) memcpy(m_.p, (from), (size)); \
+    } while (0)
 
 static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
     char name[64];
@@ -214,21 +124,19 @@ static uint64_t apiRtlAdd(Loaded&, const uint64_t*) { return 1; } // handler reg
 // and any counters the guest mixes stay stable
 static uint64_t apiGetSystemTimeAsFileTime(Loaded& l, const uint64_t* args) {
     const uint64_t zero = 0;
-    GuestMem m = guestMem(l, args[0]);
-    if (m.p && m.avail >= 8) memcpy(m.p, &zero, 8);
+    GUEST_WRITE(l, args[0], &zero, 8);
     return 0; // void
 }
 
 static uint64_t apiQueryPerformanceCounter(Loaded& l, const uint64_t* args) {
     const uint64_t zero = 0;
-    GuestMem m = guestMem(l, args[0]);
-    if (m.p && m.avail >= 8) memcpy(m.p, &zero, 8);
+    GUEST_WRITE(l, args[0], &zero, 8);
     return 1;
 }
 
 static uint64_t apiGetCurrentProcessId(Loaded&, const uint64_t*) { return 1; }
 
-    static uint64_t apiNoOp(Loaded&, const uint64_t*) { return 0; }
+static uint64_t apiNoOp(Loaded&, const uint64_t*) { return 0; }
 
 // __C_specific_handler: real SEH comes with iteration 6; the startup flow
 // only needs a truthful "no exception happened" oracle here
@@ -265,9 +173,7 @@ static uint64_t apiMemset(Loaded& l, const uint64_t* args) {
 static uint64_t apiGetCurrentProcess(Loaded&, const uint64_t*) { return 0xFFFFFFFFFFFFFFFFull; }
 
 // rand/srand: classic MSVCRT LCG, shared static seed
-namespace {
-uint64_t gRandSeed = 0;
-}
+static uint64_t gRandSeed = 0;
 
 static uint64_t apiSrand(Loaded&, const uint64_t* args) {
     gRandSeed = args[0] & 0xFFFFFFFFull;
@@ -447,8 +353,7 @@ static uint64_t apiBeginThread(Loaded& l, const uint64_t* args) {
     ++l.threadCount;
     if (args[5]) {
         uint32_t id = static_cast<uint32_t>(t.handle);
-        GuestMem m = guestMem(l, args[5]);
-        if (m.p && m.avail >= 4) memcpy(m.p, &id, 4);
+        GUEST_WRITE(l, args[5], &id, 4);
     }
     return t.handle;
 }
@@ -482,8 +387,7 @@ static uint64_t apiThrdJoin(Loaded& l, const uint64_t* args) {
     }
     if (codePtr) {
         uint32_t code = tc->exitCode;
-        GuestMem m = guestMem(l, codePtr);
-        if (m.p && m.avail >= 4) memcpy(m.p, &code, 4);
+        GUEST_WRITE(l, codePtr, &code, 4);
     }
     return 0; // thrd_success
 }
@@ -515,81 +419,8 @@ static uint64_t apiCrtFail(Loaded& l, const uint64_t*) {
     return 0;
 }
 
-uint32_t buildFakeEnv(Loaded& l) {
-    constexpr uint64_t kEnvSize = 0x2000;
-    if (!l.env.allocate(kEnvSize, true)) return fault_code(Fault::Allocation);
-    uint8_t* m = l.env.data();
-    auto put32 = [m](uint32_t off, uint32_t v) { memcpy(m + off, &v, 4); };
-    auto put16 = [m](uint32_t off, uint16_t v) { memcpy(m + off, &v, 2); };
+void registerApiStandins(Loaded& l) {
     const uint32_t B = static_cast<uint32_t>(l.env.base());
-    l.fsBase = l.env.base() + 0x100;
-    l.gsBase = l.env.base() + 0x100;
-
-    // guest heap: bump allocator for std::thread's operator new (malloc) and
-    // any other dynamic allocation; freed only on process exit
-    if (!l.heap.allocate(0x100000, true)) return fault_code(Fault::Allocation);
-    l.heapNext = l.heap.base();
-    l.heapEnd = l.heapNext + 0x100000;
-    l.threadCount = 0;
-    l.fault = fault_code(Fault::None);
-
-    // module chain: head -> ntdll (node2) -> kernel32 (node3)
-    put32(0x400, B + 0x500);
-    put32(0x500, B + 0x600);
-    put32(0x510, B + NTDLL_RVA);  // node2 DllBase, x86 LDR entry
-    put32(0x520, B + NTDLL_RVA);  // node2 DllBase, x64 LDR entry
-    put32(0x610, B + K32_RVA);    // node3 DllBase, x86
-    put32(0x620, B + K32_RVA);    // node3 DllBase, x64
-
-    // fake kernel32 image: stubs read the export directory through the PE
-    // header at [img.base()+0x3C]; x86 dir RVA at pehdr+0x78, x64 at +0x88
-    m[K32_RVA] = 'M'; m[K32_RVA + 1] = 'Z';
-    put32(K32_RVA + 0x3C, 0x40);
-    m[K32_RVA + 0x40] = 'P'; m[K32_RVA + 0x41] = 'E'; m[K32_RVA + 0x42] = 0; m[K32_RVA + 0x43] = 0;
-    put32(K32_RVA + 0x40 + 0x78, 0x100);    // x86 export dir RVA (PE hdr + 0x78)
-    put32(K32_RVA + 0x40 + 0x88, 0x100);    // x64 export dir RVA (PE hdr + 0x88)
-    // export directory at image RVA 0x100 -> env 0x900
-    put32(0x918, 2);                        // NumberOfNames
-    put32(0x91C, 0x140);                    // AddressOfFunctions
-    put32(0x920, 0x150);                    // AddressOfNames
-    put32(0x924, 0x160);                    // AddressOfNameOrdinals
-    put32(0x940, 0x200);                    // function[0] = LoadLibraryA stand-in
-    put32(0x944, 0x210);                    // function[1] = GetProcAddress stand-in
-    put32(0x950, 0x1A0);                    // names[0] RVA
-    put32(0x954, 0x1B0);                    // names[1] RVA
-    put16(0x960, 0);                        // ordinal[0]
-    put16(0x962, 1);                        // ordinal[1]
-    memcpy(m + 0x9A0, "LoadLibraryA", 13);
-    memcpy(m + 0x9B0, "GetProcAddress", 15);
-
-    // fake ntdll image: one export, resolved by the registrar stubs
-    m[NTDLL_RVA] = 'M'; m[NTDLL_RVA + 1] = 'Z';
-    put32(NTDLL_RVA + 0x3C, 0x40);
-    m[NTDLL_RVA + 0x40] = 'P'; m[NTDLL_RVA + 0x41] = 'E'; m[NTDLL_RVA + 0x42] = 0; m[NTDLL_RVA + 0x43] = 0;
-    put32(NTDLL_RVA + 0x40 + 0x78, 0x200);  // x86 export dir RVA (PE hdr + 0x78)
-    put32(NTDLL_RVA + 0x40 + 0x88, 0x200);  // x64 export dir RVA (PE hdr + 0x88)
-    // export directory at image RVA 0x200 -> env 0x1200
-    put32(0x1218, 1);                       // NumberOfNames
-    put32(0x121C, 0x240);                   // AddressOfFunctions
-    put32(0x1220, 0x250);                   // AddressOfNames
-    put32(0x1224, 0x248);                   // AddressOfNameOrdinals
-    put32(0x1240, 0x10);                    // function[0] RVA = RtlAdd* stand-in
-    put16(0x1248, 0);                       // ordinal[0]
-    put32(0x1250, 0x280);                   // names[0] RVA
-    if (l.is64) {
-        put32(0x130, B + 0x100);            // TEB+0x30 = TEB Self (x64 gs:[0x30])
-        put32(0x160, B + 0x200);            // TEB+0x60 = PEB (x64 peb walk at gs:[0x60])
-        put32(0x218, B + 0x300);            // PEB+0x18 = Ldr
-        put32(0x320, B + 0x400);            // Ldr+0x20 = InMemoryOrderModuleList.Flink
-        memcpy(m + 0x1280, "RtlAddFunctionTable", 20);
-    } else {
-        put32(0x118, B + 0x100);            // TEB+0x18 = TEB Self (x86 fs:[0x18])
-        put32(0x130, B + 0x200);            // TEB+0x30 = PEB (x86 fs:[0x30])
-        put32(0x20C, B + 0x300);            // PEB+0x0C = Ldr (absolute)
-        put32(0x314, B + 0x400);            // Ldr+0x14 = InMemoryOrderModuleList.Flink
-        memcpy(m + 0x1280, "RtlAddVectoredExceptionHandler", 31);
-    }
-
     const ApiEntry apis[] = {
         { B + ST_NT_A, 2, false, apiRtlAdd },
         { B + ST_LL_A, 1, false, apiLoadLibraryA },
@@ -623,9 +454,14 @@ uint32_t buildFakeEnv(Loaded& l) {
         { B + ST_TERMPROC, 2, false, apiCrtFail },
         { B + ST_EH4,      4, false, apiCsh },
     };
-    l.apiCount = static_cast<uint32_t>(sizeof(apis) / sizeof(apis[0]));
-    memcpy(l.apis, apis, sizeof(apis));
-    return fault_code(Fault::None);
+    for (const ApiEntry& entry : apis) {
+        if (!l.apis.add(entry)) {
+            l.fault = fault_code(Fault::UnsupportedInstruction);
+            return;
+        }
+    }
 }
+
+#undef GUEST_WRITE
 
 } // namespace stub

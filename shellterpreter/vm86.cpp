@@ -1202,7 +1202,7 @@ static uint32_t runLoop(Emu& e) {
     const uint64_t sentinel32 = kSentinel & 0xFFFFFFFFull;
     for (;;) {
         if (e.ip == sentinel32) break;
-        if (const ApiEntry* api = lookupApi(l, e.ip)) {
+        if (const ApiEntry* api = l.apis.find(e.ip)) {
             // compiled-in stand-in: stdcall, callee pops ret + args
             uint64_t args[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
             for (int i = 0; i < api->nargs && i < 8; ++i) {

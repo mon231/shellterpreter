@@ -120,7 +120,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="export_resolver.cpp" />
+        <ClCompile Include="api_table.cpp" />
+    <ClCompile Include="guest_environment.cpp" />
+    <ClCompile Include="api_standins.cpp" />
     <ClCompile Include="vm64.cpp" />
     <ClCompile Include="vm86.cpp" />
     <ClCompile Include="audit.cpp" />
@@ -135,7 +137,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vm.hpp" />
-    <ClInclude Include="export_resolver.hpp" />
+        <ClInclude Include="api_table.hpp" />
+    <ClInclude Include="guest_environment.hpp" />
+    <ClInclude Include="api_standins.hpp" />
     <ClInclude Include="audit.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

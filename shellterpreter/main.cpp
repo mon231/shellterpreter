@@ -7,7 +7,8 @@
 
 #include "vm.hpp"
 #include "audit.hpp"
-#include "export_resolver.hpp"
+#include "guest_environment.hpp"
+#include "api_standins.hpp"
 #include "shellcode_file.hpp"
 #include "pe_reader.hpp"
 
@@ -36,8 +37,12 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     if (!out.stk.allocate(stack_size, below4))
         return fault_code(Fault::Allocation);
 
-    // env/heap: GuestRegion members free themselves on any early return
-    return buildFakeEnv(out);
+    // env/heap: GuestRegion members free themselves on any early return;
+    // the stand-in registry is checked, so a full table fails closed
+    const uint32_t envErr = buildFakeEnv(out);
+    if (envErr != fault_code(Fault::None)) return envErr;
+    registerApiStandins(out);
+    return fault_code(Fault::None);
 }
 
 } // namespace stub
