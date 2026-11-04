@@ -71,9 +71,13 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "malloc"))         return l.env.base() + ST_MALLOC;
     if (nameEq(name, "free"))           return l.env.base() + ST_FREE;
     if (nameEq(name, "_callnewh"))      return l.env.base() + ST_CALLNEWH;
-    // throw helpers are resolved but only a guest raising an exception reaches
-    // them; that is not emulated yet, so they fail closed instead of returning
-    if (nameEq(name, "_CxxThrowException")) return l.env.base() + ST_CRTFAIL;
+    // throw helpers: the stand-ins record the throw and the interpreter walks
+    // the guest frames itself (see dispatchThrow in cpu.hpp)
+    if (nameEq(name, "_CxxThrowException")) return l.env.base() + ST_THROW;
+    if (nameEq(name, "RaiseException")) return l.env.base() + ST_RAISE;
+    if (nameEq(name, "__CxxFrameHandler4")) return l.env.base() + ST_CXXFRAME4;
+    if (nameEq(name, "__CxxFrameHandler3")) return l.env.base() + ST_CXXFRAME3;
+    if (nameEq(name, "_except_handler3")) return l.env.base() + ST_EH3;
     if (nameEq(name, "__std_exception_copy")) return l.env.base() + ST_CRTFAIL;
     if (nameEq(name, "__std_exception_destroy")) return l.env.base() + ST_CRTFAIL;
     if (nameEq(name, "?_Throw_Cpp_error@std@@YAXH@Z")) return l.env.base() + ST_CRTFAIL;
@@ -419,6 +423,27 @@ static uint64_t apiCrtFail(Loaded& l, const uint64_t*) {
     return 0;
 }
 
+// _CxxThrowException(obj, throwInfo): record the throw; the run loop sees
+// ehThrow after the call and walks the logged frames instead of returning.
+static uint64_t apiEhThrow(Loaded& l, const uint64_t* args) {
+    l.ehThrow.active = true;
+    l.ehThrow.objEA = args[0];
+    l.ehThrow.tiPtr = args[1];
+    return 0;
+}
+
+// RaiseException(code, flags, nargs, args): SEH form, no ThrowInfo.
+static uint64_t apiEhRaise(Loaded& l, const uint64_t* args) {
+    l.ehThrow.active = true;
+    l.ehThrow.objEA = 0;
+    l.ehThrow.tiPtr = 0;
+    l.ehThrow.code = args[0];
+    l.ehThrow.flags = args[1];
+    l.ehThrow.nargs = static_cast<uint32_t>(args[2]);
+    l.ehThrow.argsEA = args[3];
+    return 0;
+}
+
 void registerApiStandins(Loaded& l) {
     const uint32_t B = static_cast<uint32_t>(l.env.base());
     const ApiEntry apis[] = {
@@ -453,6 +478,11 @@ void registerApiStandins(Loaded& l) {
         { B + ST_GCURPROC, 1, false, apiGetCurrentProcess },
         { B + ST_TERMPROC, 2, false, apiCrtFail },
         { B + ST_EH4,      4, false, apiCsh },
+        { B + ST_THROW,    2, true,  apiEhThrow },
+        { B + ST_RAISE,    4, true,  apiEhRaise },
+        { B + ST_CXXFRAME4, 4, true, apiCsh },
+        { B + ST_CXXFRAME3, 4, true, apiCsh },
+        { B + ST_EH3,      4, true,  apiCsh },
     };
     for (const ApiEntry& entry : apis) {
         if (!l.apis.add(entry)) {

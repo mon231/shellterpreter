@@ -18,6 +18,14 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "08_cpp_thread", "tests\test
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "09_resources", "tests\test_projects\09_resources\09_resources.vcxproj", "{B0000001-0000-0000-0000-000000000009}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "07_cpp_exceptions", "tests\test_projects\07_cpp_exceptions\07_cpp_exceptions.vcxproj", "{B0000001-0000-0000-0000-000000000007}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "11_cpp_exceptions_frames", "tests\test_projects\11_cpp_exceptions\11_cpp_exceptions.vcxproj", "{B0000001-0000-0000-0000-000000000011}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "12_seh_exceptions", "tests\test_projects\12_seh_exceptions\12_seh_exceptions.vcxproj", "{B0000001-0000-0000-0000-000000000012}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "15_nested_exceptions", "tests\test_projects\15_nested_exceptions\15_nested_exceptions.vcxproj", "{B0000001-0000-0000-0000-000000000015}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -82,6 +90,38 @@ Global
 		{B0000001-0000-0000-0000-000000000008}.Release|x64.Build.0 = Release|x64
 		{B0000001-0000-0000-0000-000000000008}.Release|x86.ActiveCfg = Release|Win32
 		{B0000001-0000-0000-0000-000000000008}.Release|x86.Build.0 = Release|Win32
+		{B0000001-0000-0000-0000-000000000007}.Debug|x64.ActiveCfg = Debug|x64
+		{B0000001-0000-0000-0000-000000000007}.Debug|x64.Build.0 = Debug|x64
+		{B0000001-0000-0000-0000-000000000007}.Debug|x86.ActiveCfg = Debug|Win32
+		{B0000001-0000-0000-0000-000000000007}.Debug|x86.Build.0 = Debug|Win32
+		{B0000001-0000-0000-0000-000000000007}.Release|x64.ActiveCfg = Release|x64
+		{B0000001-0000-0000-0000-000000000007}.Release|x64.Build.0 = Release|x64
+		{B0000001-0000-0000-0000-000000000007}.Release|x86.ActiveCfg = Release|Win32
+		{B0000001-0000-0000-0000-000000000007}.Release|x86.Build.0 = Release|Win32
+		{B0000001-0000-0000-0000-000000000011}.Debug|x64.ActiveCfg = Debug|x64
+		{B0000001-0000-0000-0000-000000000011}.Debug|x64.Build.0 = Debug|x64
+		{B0000001-0000-0000-0000-000000000011}.Debug|x86.ActiveCfg = Debug|Win32
+		{B0000001-0000-0000-0000-000000000011}.Debug|x86.Build.0 = Debug|Win32
+		{B0000001-0000-0000-0000-000000000011}.Release|x64.ActiveCfg = Release|x64
+		{B0000001-0000-0000-0000-000000000011}.Release|x64.Build.0 = Release|x64
+		{B0000001-0000-0000-0000-000000000011}.Release|x86.ActiveCfg = Release|Win32
+		{B0000001-0000-0000-0000-000000000011}.Release|x86.Build.0 = Release|Win32
+		{B0000001-0000-0000-0000-000000000012}.Debug|x64.ActiveCfg = Debug|x64
+		{B0000001-0000-0000-0000-000000000012}.Debug|x64.Build.0 = Debug|x64
+		{B0000001-0000-0000-0000-000000000012}.Debug|x86.ActiveCfg = Debug|Win32
+		{B0000001-0000-0000-0000-000000000012}.Debug|x86.Build.0 = Debug|Win32
+		{B0000001-0000-0000-0000-000000000012}.Release|x64.ActiveCfg = Release|x64
+		{B0000001-0000-0000-0000-000000000012}.Release|x64.Build.0 = Release|x64
+		{B0000001-0000-0000-0000-000000000012}.Release|x86.ActiveCfg = Release|Win32
+		{B0000001-0000-0000-0000-000000000012}.Release|x86.Build.0 = Release|Win32
+		{B0000001-0000-0000-0000-000000000015}.Debug|x64.ActiveCfg = Debug|x64
+		{B0000001-0000-0000-0000-000000000015}.Debug|x64.Build.0 = Debug|x64
+		{B0000001-0000-0000-0000-000000000015}.Debug|x86.ActiveCfg = Debug|Win32
+		{B0000001-0000-0000-0000-000000000015}.Debug|x86.Build.0 = Debug|Win32
+		{B0000001-0000-0000-0000-000000000015}.Release|x64.ActiveCfg = Release|x64
+		{B0000001-0000-0000-0000-000000000015}.Release|x64.Build.0 = Release|x64
+		{B0000001-0000-0000-0000-000000000015}.Release|x86.ActiveCfg = Release|Win32
+		{B0000001-0000-0000-0000-000000000015}.Release|x86.Build.0 = Release|Win32
 		{B0000001-0000-0000-0000-000000000009}.Debug|x64.ActiveCfg = Debug|x64
 		{B0000001-0000-0000-0000-000000000009}.Debug|x64.Build.0 = Debug|x64
 		{B0000001-0000-0000-0000-000000000009}.Debug|x86.ActiveCfg = Debug|Win32

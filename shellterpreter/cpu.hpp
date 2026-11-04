@@ -1,5 +1,6 @@
 #pragma once
 #include "vm.hpp"
+#include "guest_environment.hpp"
 #include "instruction_decoder.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -859,6 +860,7 @@ private:
             const uint16_t imm = f.u16();
             uint64_t v = 0;
             if (!pop64(c.e, v)) return fault_code(Fault::OutsideMemory);
+            ehRetPop(c.l, v, c.e.r[kRSP]);
             c.ipSet = true;
             c.e.ip = v;
             c.e.r[4] += imm;
@@ -867,6 +869,7 @@ private:
         case 0xC3: {
             uint64_t v = 0;
             if (!pop64(c.e, v)) return fault_code(Fault::OutsideMemory);
+            ehRetPop(c.l, v, c.e.r[kRSP]);
             c.ipSet = true;
             c.e.ip = v;
             return fault_code(Fault::None);
@@ -906,6 +909,7 @@ private:
             const uint32_t rel = f.u32();
             const uint64_t nxt = c.l.img.base() + f.pos + 0;
             if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory);
+            ehLogCall(c.l, nxt, c.e.r[kRSP], c.e.r[kRBP]);
             c.ipSet = true;
             c.e.ip = nxt + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(rel)));
             return fault_code(Fault::None);
@@ -1147,7 +1151,10 @@ private:
                     const uint64_t a = c.oVal(8);
                     if (c.fault != fault_code(Fault::None)) return c.fault;
                     const uint64_t nxt = c.l.img.base() + f.pos;
-                    if (kind == 2) { if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory); }
+                    if (kind == 2) {
+                        if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory);
+                        ehLogCall(c.l, nxt, c.e.r[kRSP], c.e.r[kRBP]);
+                    }
                     c.ipSet = true;
                     c.e.ip = a;
                     return fault_code(Fault::None);
@@ -1155,7 +1162,10 @@ private:
                     const uint64_t a = c.oVal(c.op66 ? 2 : 4);
                     if (c.fault != fault_code(Fault::None)) return c.fault;
                     const uint64_t nxt = c.l.img.base() + f.pos;
-                    if (kind == 2) { if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory); }
+                    if (kind == 2) {
+                        if (!push64(c.e, nxt)) return fault_code(Fault::OutsideMemory);
+                        ehLogCall(c.l, nxt, c.e.r[kRSP], c.e.r[kRBP]);
+                    }
                     c.ipSet = true;
                     c.e.ip = a;
                     return fault_code(Fault::None);
@@ -1414,13 +1424,589 @@ private:
         }
     }
 
+    // ================= guest exception machinery (iteration 6) =================
+    // _CxxThrowException/RaiseException stand-ins record the throw; dispatchFrom
+    // walks the logged call frames newest-first, reads .pdata/UNWIND_INFO plus
+    // EH4 metadata out of the guest image and launches the catch/filter funclet
+    // on a synthetic sentinel return address. Anything the metadata does not
+    // fit the supported shapes is a fail-closed fault, never a guessed resume.
+
+    // Guest VA of an image RVA: the peor blob maps image RVAs 1:1 onto blob
+    // offsets (verified), starting at pe.image_offset.
+    static uint64_t ehGva(Loaded& l, uint64_t rva) {
+        return l.img.base() + l.pe.image_offset + rva;
+    }
+
+    static void ehFail(Loaded& l) {
+        l.fault = fault_code(Fault::UnsupportedInstruction);
+    }
+
+    static void ehLogCall(Loaded& l, uint64_t ret, uint64_t rspEntry, uint64_t rbp) {
+        if (l.ehLogCount < kEhLogMax) {
+            l.ehLog[l.ehLogCount].ret = ret;
+            l.ehLog[l.ehLogCount].rspEntry = rspEntry;
+            l.ehLog[l.ehLogCount].rbp = rbp;
+            ++l.ehLogCount;
+        }
+        // overflow leaves the log short of the real stack; a later throw then
+        // walks stale frames and fails closed in dispatchFrom
+    }
+
+    // Drops the logged frame for a completed call: exact match on the return
+    // address and the slot it lives in (rsp equals the slot after the pop).
+    static void ehRetPop(Loaded& l, uint64_t ret, uint64_t rsp) {
+        if (l.ehLogCount > 0 &&
+            l.ehLog[l.ehLogCount - 1].ret == ret &&
+            l.ehLog[l.ehLogCount - 1].rspEntry == rsp)
+            --l.ehLogCount;
+    }
+
+    // ehdata4_export.h ReadUnsigned: the low nibble of the first byte selects
+    // negLength/shift; the value is read from the dword that ends at byte 0.
+    static bool eh4ReadUnsigned(Emu& e, uint64_t& p, uint32_t& out) {
+        uint8_t b0;
+        if (!memLd<uint8_t>(e, p, b0)) return false;
+        static const int8_t negLen[16] = {-1,-2,-1,-3,-1,-2,-1,-4,-1,-2,-1,-3,-1,-2,-1,-5};
+        static const uint8_t shiftT[16] = {25,18,25,11,25,18,25,4,25,18,25,11,25,18,25,0};
+        const int nl = negLen[b0 & 0x0F];
+        uint32_t window;
+        if (!memLd<uint32_t>(e, p - nl - 4, window)) return false;
+        p -= nl; // nl is negative: the cursor advances past the value bytes
+        out = (window >> shiftT[b0 & 0x0F]) & 0xFFFFFFFFu;
+        return true;
+    }
+
+    static bool eh4ReadInt(Emu& e, uint64_t& p, int32_t& out) {
+        uint32_t v;
+        if (!memLd<uint32_t>(e, p, v)) return false;
+        p += 4;
+        out = static_cast<int32_t>(v);
+        return true;
+    }
+
+    // RUNTIME_FUNCTION for the image RVA of pc (a return address - 1). Also
+    // enforces the RVA==blob-offset identity: every section with raw data must
+    // have PointerToRawData == VirtualAddress, else fail closed.
+    static bool ehFindFunction(Emu& e, Loaded& l, uint64_t pcGuest,
+                               uint32_t& fnBegin, uint32_t& fnEnd, uint32_t& unwindRva) {
+        const uint64_t img0 = ehGva(l, 0);
+        if (pcGuest < img0) return false;
+        const uint64_t rva = pcGuest - img0;
+        uint32_t lfanew;
+        if (!memLd<uint32_t>(e, img0 + 0x3C, lfanew)) return false;
+        uint32_t sig;
+        if (!memLd<uint32_t>(e, img0 + lfanew, sig) || sig != 0x00004550) return false; // "PE\0\0"
+        uint16_t numSec;
+        if (!memLd<uint16_t>(e, img0 + lfanew + 6, numSec) || numSec == 0 || numSec > 96) return false;
+        uint16_t optSize;
+        if (!memLd<uint16_t>(e, img0 + lfanew + 20, optSize)) return false;
+        uint16_t magic;
+        if (!memLd<uint16_t>(e, img0 + lfanew + 24, magic)) return false;
+        const uint64_t dirBase = img0 + lfanew + 24 + (magic == 0x20B ? 112 : 96);
+        uint32_t pdRva, pdSize;
+        if (!memLd<uint32_t>(e, dirBase + 3 * 8, pdRva) ||
+            !memLd<uint32_t>(e, dirBase + 3 * 8 + 4, pdSize) ||
+            pdRva == 0 || pdSize < 12) return false;
+        const uint32_t n = pdSize / 12;
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t b, en, u;
+            const uint64_t e3 = ehGva(l, pdRva) + 12ull * i;
+            if (!memLd<uint32_t>(e, e3, b) ||
+                !memLd<uint32_t>(e, e3 + 4, en) ||
+                !memLd<uint32_t>(e, e3 + 8, u)) return false;
+            if (b <= rva && rva < en) { fnBegin = b; fnEnd = en; unwindRva = u; return true; }
+        }
+        return false;
+    }
+
+    // x86 EH3/SEH3: the FS:[0] registration chain is the authentic walk. Node
+    // forms (MSVC 14.x):
+    //   C++ EH3: {next, handler thunk, trylevel} - handler = `nop nop; mov
+    //            eax,<FuncInfoVA>; jmp [IAT __CxxFrameHandler3]`
+    //   SEH3:    {next, handler, scopetable, trylevel} - handler = `jmp [IAT
+    //            _except_handler3]`, scopetable entries {enclosing, filter,
+    //            handler} indexed by trylevel
+    // All metadata fields are link-time VAs (image base 0x400000); the blob is
+    // mapped at img.base()+image_offset, so guest VA = ehGva(rva) with
+    // rva = va - pe.image_base. Stack pointers (nodes, ebp) are runtime VAs.
+    static void dispatchFrom86(Loaded& l, Emu& e, uint64_t node) {
+        while (node != 0) {
+            uint32_t next, handler, third;
+            if (!memLd<uint32_t>(e, node, next) ||
+                !memLd<uint32_t>(e, node + 4, handler) ||
+                !memLd<uint32_t>(e, node + 8, third)) { ehFail(l); return; }
+            uint8_t h0, h1;
+            if (!memLd<uint8_t>(e, handler, h0) ||
+                !memLd<uint8_t>(e, handler + 1, h1)) { ehFail(l); return; }
+
+            if (h0 == 0x90 && h1 == 0x90) {
+                // C++ EH3 frame
+                uint8_t b2;
+                if (!memLd<uint8_t>(e, (handler) + 2, b2) || b2 != 0xB8) { ehFail(l); return; }
+                uint32_t funcInfo;
+                if (!memLd<uint32_t>(e, (handler) + 3, funcInfo)) { ehFail(l); return; }
+                // resolve the personality through the thunk's jmp
+                uint8_t j0;
+                if (!memLd<uint8_t>(e, (handler) + 7, j0)) { ehFail(l); return; }
+                uint32_t slotAddr;
+                if (j0 == 0xFF) { // FF 25 addr32
+                    if (!memLd<uint32_t>(e, (handler) + 9, slotAddr)) { ehFail(l); return; }
+                } else if (j0 == 0xE9) { // E9 rel32 into a jmp [IAT]
+                    uint32_t rel;
+                    if (!memLd<uint32_t>(e, (handler) + 8, rel)) { ehFail(l); return; }
+                    const uint32_t target = handler + 12 + rel;
+                    uint8_t j1a, j1b;
+                    if (!memLd<uint8_t>(e, (target), j1a) ||
+                        !memLd<uint8_t>(e, (target) + 1, j1b) ||
+                        j1a != 0xFF || j1b != 0x25 ||
+                        !memLd<uint32_t>(e, (target) + 2, slotAddr)) { ehFail(l); return; }
+                } else { ehFail(l); return; }
+                uint32_t slotVal;
+                if (!memLd<uint32_t>(e, (slotAddr), slotVal)) { ehFail(l); return; }
+                if (static_cast<uint64_t>(slotVal - l.env.base()) != ST_CXXFRAME3) { ehFail(l); return; }
+                if (l.ehThrow.tiPtr == 0) { node = next; continue; } // SEH throw past a C++ frame
+
+                uint32_t magic, maxState, nTB, pTBM;
+                int32_t pUW;
+                if (!memLd<uint32_t>(e, (funcInfo), magic) ||
+                    !memLd<uint32_t>(e, (funcInfo) + 4, maxState) ||
+                    !memLd<int32_t>(e, (funcInfo) + 8, pUW) ||
+                    !memLd<uint32_t>(e, (funcInfo) + 12, nTB) ||
+                    !memLd<uint32_t>(e, (funcInfo) + 16, pTBM)) { ehFail(l); return; }
+                (void)pUW; (void)maxState;
+                if (magic != 0x19930522) { ehFail(l); return; }
+                const uint64_t ebp = node + 0xC;
+                const int32_t state = static_cast<int32_t>(third); // trylevel at throw
+                for (uint32_t t = 0; t < nTB; ++t) {
+                    int32_t tryLow, tryHigh, catchHigh;
+                    uint32_t nC, pHandler;
+                    if (!memLd<int32_t>(e, (pTBM) + 20ull * t, tryLow) ||
+                        !memLd<int32_t>(e, (pTBM) + 20ull * t + 4, tryHigh) ||
+                        !memLd<int32_t>(e, (pTBM) + 20ull * t + 8, catchHigh) ||
+                        !memLd<uint32_t>(e, (pTBM) + 20ull * t + 12, nC) ||
+                        !memLd<uint32_t>(e, (pTBM) + 20ull * t + 16, pHandler)) { ehFail(l); return; }
+                    if (state < tryLow || state > tryHigh) continue;
+                    for (uint32_t h = 0; h < nC; ++h) {
+                        uint32_t adj, pType, aoh;
+                        int32_t dispCatch;
+                        if (!memLd<uint32_t>(e, (pHandler) + 16ull * h, adj) ||
+                            !memLd<uint32_t>(e, (pHandler) + 16ull * h + 4, pType) ||
+                            !memLd<int32_t>(e, (pHandler) + 16ull * h + 8, dispCatch) ||
+                            !memLd<uint32_t>(e, (pHandler) + 16ull * h + 12, aoh)) { ehFail(l); return; }
+                        if (adj != 0) { ehFail(l); return; }
+                        bool match = pType == 0; // catch(...)
+                        uint32_t matchCt = 0;
+                        if (pType != 0) {
+                            uint32_t cta;
+                            if (!memLd<uint32_t>(e, (l.ehThrow.tiPtr) + 12, cta)) { ehFail(l); return; }
+                            uint32_t nCt;
+                            if (!memLd<uint32_t>(e, (cta), nCt)) { ehFail(l); return; }
+                            for (uint32_t ci = 0; ci < nCt && !match; ++ci) {
+                                uint32_t ct;
+                                if (!memLd<uint32_t>(e, (cta) + 4 + 4ull * ci, ct)) { ehFail(l); return; }
+                                uint32_t ctType;
+                                if (!memLd<uint32_t>(e, (ct) + 4, ctType)) { ehFail(l); return; }
+                                if (ctType == pType) { match = true; matchCt = ct; }
+                            }
+                        }
+                        if (!match) continue;
+                        // catch object copy into the frame (0 = no copy slot)
+                        if (pType != 0 && dispCatch != 0) {
+                            int32_t mdisp;
+                            uint32_t sz;
+                            if (!memLd<int32_t>(e, (matchCt) + 8, mdisp) ||
+                                !memLd<uint32_t>(e, (matchCt) + 0x14, sz)) { ehFail(l); return; }
+                            const uint64_t dst = ebp + static_cast<uint64_t>(dispCatch);
+                            const uint64_t src = l.ehThrow.objEA + static_cast<uint64_t>(mdisp);
+                            for (uint32_t by = 0; by < sz; ++by) {
+                                uint8_t byv;
+                                if (!memLd<uint8_t>(e, src + by, byv) ||
+                                    !memSt<uint8_t>(e, dst + by, byv)) { ehFail(l); return; }
+                            }
+                        }
+                        // The catch handler is a funclet: the CRT calls it and
+                        // its return value (eax) is the continuation address.
+                        // Release emits a pure `mov eax,<cont>; ret` thunk (the
+                        // catch body is inlined at the continuation); Debug does
+                        // the catch work inside the funclet itself. Either way
+                        // the funclet runs with the parent's ebp.
+                        // nested throws inside the catch must not re-match this try
+                        if (!memSt<uint32_t>(e, node + 8, static_cast<uint32_t>(catchHigh))) { ehFail(l); return; }
+                        l.eh = EhPending{};
+                        l.eh.active = true;
+                        l.eh.mode = 3;
+                        l.eh.contBase = ebp;
+                        uint32_t savedEsp;
+                        if (!memLd<uint32_t>(e, ebp - 0x10, savedEsp)) { ehFail(l); return; }
+                        e.r[kRBP] = ebp;
+                        e.r[kRSP] = savedEsp - 4; // as if the CRT had called it
+                        if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinelSub))) { ehFail(l); return; }
+                        e.ip = aoh;
+                        return;
+                    }
+                }
+                node = next;
+                continue;
+            }
+
+            if (h0 == 0xFF && h1 == 0x25) {
+                // SEH3 frame: handler = `jmp dword ptr [IAT]`
+                uint32_t slotAddr, slotVal;
+                if (!memLd<uint32_t>(e, (handler) + 2, slotAddr) ||
+                    !memLd<uint32_t>(e, (slotAddr), slotVal)) { ehFail(l); return; }
+                if (static_cast<uint64_t>(slotVal - l.env.base()) != ST_EH3) { ehFail(l); return; }
+                if (l.ehThrow.tiPtr != 0) { node = next; continue; } // C++ throw past an SEH frame
+
+                const uint32_t scopetable = third;
+                uint32_t lvl;
+                if (!memLd<uint32_t>(e, node + 0xC, lvl)) { ehFail(l); return; }
+                const int32_t level = static_cast<int32_t>(lvl);
+                if (level < 0) { node = next; continue; }
+                const uint64_t ebp = node + 0x10;
+                uint32_t filter, handlerAddr;
+                if (!memLd<uint32_t>(e, (scopetable) + 12ull * level + 4, filter) ||
+                    !memLd<uint32_t>(e, (scopetable) + 12ull * level + 8, handlerAddr)) { ehFail(l); return; }
+                if (filter == 0) { ehFail(l); return; } // __finally: unsupported
+                // EXCEPTION_RECORD + EXCEPTION_POINTERS below the frame; the
+                // filter reads the pointer from the fixed [ebp-14h] slot
+                const uint32_t er = static_cast<uint32_t>(ebp) - 0xC0;
+                const uint32_t ep = static_cast<uint32_t>(ebp) - 0x68;
+                if (!memSt<uint32_t>(e, er + 0, static_cast<uint32_t>(l.ehThrow.code)) ||
+                    !memSt<uint32_t>(e, er + 4, static_cast<uint32_t>(l.ehThrow.flags)) ||
+                    !memSt<uint32_t>(e, er + 8, 0) ||
+                    !memSt<uint32_t>(e, er + 0xC, 0) ||
+                    !memSt<uint32_t>(e, er + 0x10, l.ehThrow.nargs) ||
+                    !memSt<uint32_t>(e, er + 0x14, 0)) { ehFail(l); return; }
+                for (uint32_t a = 0; a < l.ehThrow.nargs && a < 15; ++a) {
+                    uint32_t av;
+                    if (!memLd<uint32_t>(e, l.ehThrow.argsEA + 4ull * a, av) ||
+                        !memSt<uint32_t>(e, er + 0x14 + 4ull * a, av)) { ehFail(l); return; }
+                }
+                if (!memSt<uint32_t>(e, ep, er) || !memSt<uint32_t>(e, ep + 4, 0) ||
+                    !memSt<uint32_t>(e, ebp - 0x14, ep)) { ehFail(l); return; }
+                l.eh = EhPending{};
+                l.eh.active = true;
+                l.eh.mode = 2;
+                l.eh.contBase = ebp;
+                l.eh.contVals[0] = (handlerAddr);
+                l.eh.walkFrame = node;
+                e.r[kRBP] = ebp;
+                e.r[kRSP] = ebp - 0x40;
+                if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinelSub))) { ehFail(l); return; }
+                e.ip = (filter);
+                return;
+            }
+
+            ehFail(l); // unknown registration node form
+            return;
+        }
+        ehFail(l); // walked the whole chain: nothing handles this throw
+    }
+
+    // Walk logged frames newest-first from index `from` and launch the first
+    // matching handler. `from` is ehLogCount at throw time; the frame at
+    // from-1 is the throw stand-in call itself.
+    static void dispatchFrom(Loaded& l, Emu& e, uint32_t from) {
+        if constexpr (!is64) {
+            // x86: walk the FS:[0] registration chain instead of the call log
+            (void)from;
+            uint32_t n0;
+            if (!memLd<uint32_t>(e, e.fsBase, n0)) { ehFail(l); return; }
+            dispatchFrom86(l, e, n0);
+            return;
+        }
+        const uint64_t img0 = ehGva(l, 0);
+        for (uint32_t k = from; k > 0; --k) {
+            const uint64_t ret = l.ehLog[k - 1].ret;
+            const uint64_t estRsp = l.ehLog[k - 1].rspEntry + 8;
+            uint32_t fnBegin, fnEnd, unwindRva;
+            if (!ehFindFunction(e, l, ret - 1, fnBegin, fnEnd, unwindRva)) continue;
+            const uint32_t rva = static_cast<uint32_t>(ret - img0);
+            uint8_t b0;
+            if (!memLd<uint8_t>(e, ehGva(l, unwindRva), b0)) { ehFail(l); return; }
+            const uint32_t ver = b0 & 7;
+            if (ver != 1 && ver != 2) { ehFail(l); return; }
+            const uint32_t flags = (b0 >> 3) & 0x1F;
+            if (flags & 4) { ehFail(l); return; }   // chained unwind info
+            if (!(flags & 3)) continue;             // funclet/leaf: no personality
+            uint8_t cnt;
+            if (!memLd<uint8_t>(e, ehGva(l, unwindRva) + 2, cnt)) { ehFail(l); return; }
+            const uint64_t hOff = ehGva(l, unwindRva) + 4 + 2ull * cnt + ((cnt & 1) ? 2 : 0);
+            uint32_t hRva, dRva;
+            if (!memLd<uint32_t>(e, hOff, hRva) ||
+                !memLd<uint32_t>(e, hOff + 4, dRva)) { ehFail(l); return; }
+            // personality: thunk `jmp [IAT]` -> slot -> stand-in kind
+            uint8_t j0, j1;
+            if (!memLd<uint8_t>(e, ehGva(l, hRva), j0) ||
+                !memLd<uint8_t>(e, ehGva(l, hRva) + 1, j1) ||
+                j0 != 0xFF || j1 != 0x25) { ehFail(l); return; }
+            uint32_t relU;
+            if (!memLd<uint32_t>(e, ehGva(l, hRva) + 2, relU)) { ehFail(l); return; }
+            const uint64_t slotRva = hRva + 6 + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(relU)));
+            uint64_t slotVal;
+            if (!memLd<uint64_t>(e, ehGva(l, slotRva), slotVal)) { ehFail(l); return; }
+            const uint64_t kind = slotVal - l.env.base();
+
+            if (l.ehThrow.tiPtr != 0) {
+                // C++ throw: only __CxxFrameHandler4 frames participate (FH3 is x86)
+                if (kind != ST_CXXFRAME4) continue;
+                // FuncInfo4 at dRva
+                uint64_t p = ehGva(l, dRva);
+                uint8_t fh;
+                if (!memLd<uint8_t>(e, p++, fh)) { ehFail(l); return; }
+                if (fh & 0x80) { ehFail(l); return; }          // reserved
+                if (fh & 0x02) { ehFail(l); return; }          // separated code
+                uint32_t cu;
+                if (fh & 0x04 && !eh4ReadUnsigned(e, p, cu)) { ehFail(l); return; }  // BBT flags
+                int32_t i32v;
+                if (fh & 0x08 && !eh4ReadInt(e, p, i32v)) { ehFail(l); return; }     // unwind map (unused)
+                int32_t tbmRva = 0;
+                if (fh & 0x10 && !eh4ReadInt(e, p, tbmRva)) { ehFail(l); return; }
+                int32_t ip2Rva;
+                if (!eh4ReadInt(e, p, ip2Rva)) { ehFail(l); return; }
+                if (fh & 0x01 && !eh4ReadUnsigned(e, p, cu)) { ehFail(l); return; }  // dispFrame
+                // current state at the throw point (entries store state+1)
+                uint32_t state = 0xFFFFFFFF; // -1
+                {
+                    uint64_t q = ehGva(l, static_cast<uint32_t>(ip2Rva));
+                    uint32_t n2, prev = 0;
+                    if (!eh4ReadUnsigned(e, q, n2)) { ehFail(l); return; }
+                    for (uint32_t i = 0; i < n2; ++i) {
+                        uint32_t d, st;
+                        if (!eh4ReadUnsigned(e, q, d) || !eh4ReadUnsigned(e, q, st)) { ehFail(l); return; }
+                        prev += d;
+                        if (prev <= rva - fnBegin) state = st - 1; else break;
+                    }
+                }
+                if (tbmRva == 0 || state == 0xFFFFFFFF) continue;
+                uint64_t q = ehGva(l, static_cast<uint32_t>(tbmRva));
+                uint32_t nT;
+                if (!eh4ReadUnsigned(e, q, nT)) { ehFail(l); return; }
+                for (uint32_t t = 0; t < nT; ++t) {
+                    uint32_t lo, hi, chigh;
+                    int32_t hArr;
+                    if (!eh4ReadUnsigned(e, q, lo) || !eh4ReadUnsigned(e, q, hi) ||
+                        !eh4ReadUnsigned(e, q, chigh) || !eh4ReadInt(e, q, hArr)) { ehFail(l); return; }
+                    if (state < lo || state > hi) continue;
+                    uint64_t hq = ehGva(l, static_cast<uint32_t>(hArr));
+                    uint32_t nH;
+                    if (!eh4ReadUnsigned(e, hq, nH)) { ehFail(l); return; }
+                    for (uint32_t h = 0; h < nH; ++h) {
+                        uint8_t hv;
+                        if (!memLd<uint8_t>(e, hq++, hv)) { ehFail(l); return; }
+                        uint32_t dispCatch = 0;
+                        int32_t dispType = 0;
+                        const bool hasType = (hv >> 1) & 1;
+                        const bool hasObj = (hv >> 2) & 1;
+                        if (hv & 1) { if (!eh4ReadUnsigned(e, hq, cu)) { ehFail(l); return; } }
+                        if (hasType && !eh4ReadInt(e, hq, dispType)) { ehFail(l); return; }
+                        if (hasObj && !eh4ReadUnsigned(e, hq, dispCatch)) { ehFail(l); return; }
+                        int32_t funclet;
+                        if (!eh4ReadInt(e, hq, funclet)) { ehFail(l); return; }
+                        const uint32_t contCount = (hv >> 4) & 3;
+                        const bool contIsRva = (hv >> 3) & 1;
+                        uint32_t cont0 = 0;
+                        if (contCount >= 1) {
+                            if (contIsRva) {
+                                if (!memLd<uint32_t>(e, hq, cont0)) { ehFail(l); return; }
+                                hq += 4;
+                            } else if (!eh4ReadUnsigned(e, hq, cont0)) { ehFail(l); return; }
+                            for (uint32_t cc = 1; cc < contCount; ++cc) {
+                                if (contIsRva) hq += 4;
+                                else if (!eh4ReadUnsigned(e, hq, cu)) { ehFail(l); return; }
+                            }
+                        }
+                        // type match: exact TD RVA equality with a thrown CT
+                        uint32_t matchCt = 0;
+                        bool match = !hasType; // catch(...)
+                        if (hasType) {
+                            const uint32_t tiRva = static_cast<uint32_t>(l.ehThrow.tiPtr - img0);
+                            uint32_t cta;
+                            if (!memLd<uint32_t>(e, ehGva(l, tiRva) + 12, cta)) { ehFail(l); return; }
+                            uint32_t nC;
+                            if (!memLd<uint32_t>(e, ehGva(l, cta), nC)) { ehFail(l); return; }
+                            for (uint32_t ci = 0; ci < nC && !match; ++ci) {
+                                uint32_t ctRva;
+                                if (!memLd<uint32_t>(e, ehGva(l, cta) + 4 + 4ull * ci, ctRva)) { ehFail(l); return; }
+                                uint32_t td;
+                                if (!memLd<uint32_t>(e, ehGva(l, ctRva) + 4, td)) { ehFail(l); return; }
+                                if (td == static_cast<uint32_t>(dispType)) { match = true; matchCt = ctRva; }
+                            }
+                        }
+                        if (!match) continue;
+                        if (contCount > 1) { ehFail(l); return; } // multi-continuation unsupported
+                        // CatchableType: {props, dispType, mdisp, pdisp, vdisp, sizeOrOffset}
+                        if (hasObj) {
+                            int32_t mdisp;
+                            uint32_t sz;
+                            if (!memLd<uint32_t>(e, ehGva(l, matchCt) + 8, *reinterpret_cast<uint32_t*>(&mdisp)) ||
+                                !memLd<uint32_t>(e, ehGva(l, matchCt) + 0x14, sz)) { ehFail(l); return; }
+                            const uint64_t dst = estRsp + dispCatch;
+                            const uint64_t src = l.ehThrow.objEA + static_cast<uint64_t>(mdisp);
+                            for (uint32_t by = 0; by < sz; ++by) {
+                                uint8_t byv;
+                                if (!memLd<uint8_t>(e, src + by, byv) ||
+                                    !memSt<uint8_t>(e, dst + by, byv)) { ehFail(l); return; }
+                            }
+                        }
+                        // launch the catch funclet on a synthetic sentinel return
+                        l.ehLogCount = k - 1; // drop this frame and everything newer
+                        l.eh = EhPending{};
+                        l.eh.active = true;
+                        l.eh.mode = 1;
+                        l.eh.estRsp = estRsp;
+                        l.eh.logMark = k - 1;
+                        if (contCount == 1) {
+                            l.eh.contKind = 1;
+                            l.eh.contVals[0] = contIsRva ? ehGva(l, cont0)
+                                                         : ehGva(l, fnBegin + cont0);
+                        }
+                        e.r[kRSP] = estRsp - 8;
+                        if (!memSt<uint64_t>(e, e.r[kRSP], kSentinelSub)) { ehFail(l); return; }
+                        e.r[1] = hasObj ? estRsp + dispCatch : l.ehThrow.objEA; // rcx
+                        e.r[2] = estRsp;                                        // rdx
+                        // real unwinding restores callee-saved rbp per frame;
+                        // Debug continuations address locals via the frame's rbp
+                        e.r[kRBP] = l.ehLog[k - 1].rbp;
+                        e.ip = ehGva(l, static_cast<uint32_t>(funclet));
+                        return;
+                    }
+                }
+                continue; // no catch in this frame
+            }
+
+            // SEH throw (RaiseException): __C_specific_handler frames only
+            if (kind != ST_CSH) continue;
+            // the scope table follows the handler RVA inline in UNWIND_INFO
+            uint64_t q = hOff + 4;
+            uint32_t nS;
+            if (!memLd<uint32_t>(e, q, nS) || nS > 64) { ehFail(l); return; }
+            for (uint32_t s = 0; s < nS; ++s) {
+                uint32_t sb, se, sf, sh;
+                const uint64_t sq = q + 4 + 16ull * s;
+                if (!memLd<uint32_t>(e, sq, sb) || !memLd<uint32_t>(e, sq + 4, se) ||
+                    !memLd<uint32_t>(e, sq + 8, sf) || !memLd<uint32_t>(e, sq + 12, sh)) { ehFail(l); return; }
+                if (rva < sb || rva >= se) continue;
+                if (sf == 0) { ehFail(l); return; } // __finally: unsupported
+                // materialize EXCEPTION_RECORD64 + EXCEPTION_POINTERS below the
+                // funclet frame; the filter only reads the code through [rcx]
+                const uint64_t er = estRsp - 0x100;
+                const uint64_t ep = estRsp - 0xE0;
+                if (!memSt<uint32_t>(e, er + 0, static_cast<uint32_t>(l.ehThrow.code)) ||
+                    !memSt<uint32_t>(e, er + 4, static_cast<uint32_t>(l.ehThrow.flags)) ||
+                    !memSt<uint64_t>(e, er + 8, 0) ||
+                    !memSt<uint64_t>(e, er + 0x10, 0) ||
+                    !memSt<uint32_t>(e, er + 0x18, l.ehThrow.nargs) ||
+                    !memSt<uint32_t>(e, er + 0x1C, 0)) { ehFail(l); return; }
+                for (uint32_t a = 0; a < l.ehThrow.nargs && a < 15; ++a) {
+                    uint64_t av;
+                    if (!memLd<uint64_t>(e, l.ehThrow.argsEA + 8ull * a, av) ||
+                        !memSt<uint64_t>(e, er + 0x20 + 8ull * a, av)) { ehFail(l); return; }
+                }
+                if (!memSt<uint64_t>(e, ep, er) || !memSt<uint64_t>(e, ep + 8, 0)) { ehFail(l); return; }
+                l.ehLogCount = k - 1;
+                l.eh = EhPending{};
+                l.eh.active = true;
+                l.eh.mode = 2;
+                l.eh.estRsp = estRsp;
+                l.eh.logMark = k - 1;
+                l.eh.contKind = 1;
+                l.eh.contVals[0] = ehGva(l, sh); // handler resume IP
+                e.r[kRSP] = estRsp - 8;
+                if (!memSt<uint64_t>(e, e.r[kRSP], kSentinelSub)) { ehFail(l); return; }
+                e.r[1] = ep;     // rcx = EXCEPTION_POINTERS*
+                e.r[2] = estRsp; // rdx = establisher frame rsp
+                e.ip = ehGva(l, sf);
+                return;
+            }
+            continue;
+        }
+        // walked every frame: nothing handles this throw
+        ehFail(l);
+    }
+
+    // A funclet returned: its ret popped kSentinelSub. Finish the pending
+    // catch, or continue the SEH walk with the filter's verdict in RAX.
+    static void ehResume(Loaded& l, Emu& e) {
+        l.ehLogCount = l.eh.logMark;
+        if (l.eh.mode == 1) {
+            l.eh.active = false;
+            e.r[kRSP] = l.eh.estRsp;
+            if (l.eh.contKind == 1) {
+                e.ip = l.eh.contVals[0];
+            } else {
+                // contCount == 0: the funclet returned the continuation
+                // address in rax directly (Debug codegen)
+                e.ip = e.r[0];
+            }
+            return;
+        }
+        if (l.eh.mode == 2) {
+            if constexpr (is64) {
+                const uint64_t verdict = e.r[0];
+                l.eh.active = false;
+                if (verdict == 1) {            // EXCEPTION_EXECUTE_HANDLER
+                    e.r[kRSP] = l.eh.estRsp;
+                    e.ip = l.eh.contVals[0];
+                    return;
+                }
+                if (verdict == 0) {            // EXCEPTION_CONTINUE_SEARCH: keep walking
+                    dispatchFrom(l, e, l.ehLogCount);
+                    return;
+                }
+                ehFail(l);                     // -1 (continue execution): unsupported
+                return;
+            }
+            // x86 SEH3: the filter ran as a sub-run; its verdict is in eax
+            const uint32_t verdict = static_cast<uint32_t>(e.r[0]);
+            l.eh.active = false;
+            if (verdict == 1) {                // EXCEPTION_EXECUTE_HANDLER
+                e.r[kRBP] = l.eh.contBase;
+                // the generated __except body restores esp itself
+                e.r[kRSP] = l.eh.contBase - 0x100;
+                e.ip = l.eh.contVals[0];
+                return;
+            }
+            if (verdict == 0) {                // EXCEPTION_CONTINUE_SEARCH: next node
+                uint32_t next;
+                if (!memLd<uint32_t>(e, l.eh.walkFrame, next)) { ehFail(l); return; }
+                dispatchFrom86(l, e, next);
+                return;
+            }
+            ehFail(l);                         // -1 (continue execution): unsupported
+            return;
+        }
+        if (l.eh.mode == 3) {
+            // x86 C++ EH3: the catch funclet returned the continuation in eax
+            const uint32_t cont = static_cast<uint32_t>(e.r[0]);
+            l.eh.active = false;
+            e.r[kRBP] = l.eh.contBase;
+            uint32_t savedEsp;
+            if (!memLd<uint32_t>(e, l.eh.contBase - 0x10, savedEsp)) { ehFail(l); return; }
+            e.r[kRSP] = savedEsp; // _JumpToContinuation restores the saved ESP
+            e.ip = cont;
+            return;
+        }
+        ehFail(l);
+    }
+
     static uint32_t runLoop(Emu& e) {
         Loaded& l = *e.l;
         for (;;) {
             if constexpr (is64) {
                 if (e.ip == kSentinel) break;
+                if (e.ip == kSentinelSub && l.eh.active) {
+                    ehResume(l, e);
+                    if (l.fault != fault_code(Fault::None)) return l.fault;
+                    continue;
+                }
             } else {
                 if (e.ip == (kSentinel & 0xFFFFFFFFull)) break;
+                if (e.ip == (kSentinelSub & 0xFFFFFFFFull) && l.eh.active) {
+                    ehResume(l, e);
+                    if (l.fault != fault_code(Fault::None)) return l.fault;
+                    continue;
+                }
             }
             if (const ApiEntry* api = l.apis.find(e.ip)) {
                 // compiled-in stand-in; the calling convention is per-arch
@@ -1450,6 +2036,15 @@ private:
                     e.r[0] = static_cast<uint32_t>(api->fn(l, args));
                 }
                 if (l.fault != fault_code(Fault::None)) return l.fault;
+                if (l.ehThrow.active) {
+                    // the throw stand-ins never "return": dispatch the guest
+                    // exception instead of continuing at the return address
+                    l.ehThrow.active = false;
+                    dispatchFrom(l, e, l.ehLogCount);
+                    if (l.fault != fault_code(Fault::None)) return l.fault;
+                    continue;
+                }
+                ehRetPop(l, ret, e.r[kRSP]);
                 e.ip = ret;
                 continue;
             }
@@ -1468,6 +2063,11 @@ private:
                 if (r == fault_code(Fault::Halt)) break; // stub chain end: exit code = EAX
                 if (r == fault_code(Fault::OutsideMemory)) {
                     fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX (off=0x%llX)\n",
+                            static_cast<unsigned long long>(e.ip),
+                            static_cast<unsigned long long>(e.ip - l.img.base()));
+                }
+                if (r == fault_code(Fault::UnsupportedInstruction)) {
+                    fprintf(stderr, "fault: unimplemented opcode at ip=0x%llX (off=0x%llX)\n",
                             static_cast<unsigned long long>(e.ip),
                             static_cast<unsigned long long>(e.ip - l.img.base()));
                 }

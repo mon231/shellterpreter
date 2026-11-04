@@ -11,7 +11,49 @@
 namespace stub {
 
 
+constexpr uint32_t kEhLogMax = 128;
+
+
 constexpr uint64_t kSentinel = 0x0000BAD0C0FFEE10ull;
+// sub-run sentinel: address the EH dispatch pushes as the funclet's return
+// address; runLoop resumes the pending catch when the funclet's ret pops it
+constexpr uint64_t kSentinelSub = 0x0000BAD0C0FFEE20ull;
+
+// One logged guest call for the EH unwinder: a return address pushed by a
+// real call plus the rsp slot it lives in (est frame rsp = rspEntry + 8).
+struct EhCallFrame {
+    uint64_t ret;
+    uint64_t rspEntry;
+    uint64_t rbp;   // caller's rbp at the call site = frame rbp after unwind
+};
+
+// Native throw recorded by the _CxxThrowException/RaiseException stand-ins;
+// the interpreter-driven EH dispatch walks the logged call frames instead of
+// returning to the throw site.
+struct EhThrow {
+    bool active = false;
+    uint64_t objEA = 0;   // guest ptr of the thrown object (rcx at throw)
+    uint64_t tiPtr = 0;   // guest ptr of ThrowInfo (rdx at throw)
+    // SEH form (tiPtr == 0): RaiseException parameters
+    uint64_t code = 0;
+    uint64_t flags = 0;
+    uint32_t nargs = 0;
+    uint64_t argsEA = 0;  // guest ptr of the exception args array
+};
+
+// Pending catch: state saved while the catch/except funclet runs. The
+// funclet's ret pops kSentinelSub and the run loop resumes here.
+struct EhPending {
+    bool active = false;
+    int  mode = 0;             // 1 = C++ catch resume, 2 = SEH filter result pending
+    uint64_t estRsp = 0;       // establisher frame rsp the funclet returns to
+    uint64_t contBase = 0;     // owner frame's function start (kind-1 conts are relative to it)
+    uint64_t contVals[2] = {0, 0}; // continuation addresses (function-relative)
+    int contKind = -1;         // HandlerTypeHeader::contAddr kind: 0 none, 1 one address
+    uint32_t logMark = 0;      // ehLogCount at dispatch; restored when the funclet returns
+    uint32_t walkFrame = 0;    // walk resume state for SEH filters
+    uint32_t walkIdx = 0;
+};
 
 
 // One emulated guest thread. A stand-in creates it and the join stand-in runs
@@ -38,6 +80,11 @@ struct Loaded {
     ThreadContext threads[8];
     uint32_t threadCount;
     uint32_t fault; // stand-in sets this to fail closed
+    // iteration 6: guest exception machinery state
+    EhCallFrame ehLog[kEhLogMax];
+    uint32_t ehLogCount = 0;
+    EhThrow ehThrow;
+    EhPending eh;
     PeInfo   pe;
     bool     is64;
     bool     hasImage;

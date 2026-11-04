@@ -22,7 +22,7 @@ struct ApiEntry {
 // run loops call before every guest step.
 class ApiTable {
 public:
-    static constexpr uint32_t max_entries = 32;
+    static constexpr uint32_t max_entries = 64;
 
     bool add(const ApiEntry& entry);
     const ApiEntry* find(uint64_t addr) const;

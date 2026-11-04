@@ -49,6 +49,11 @@ constexpr uint32_t ST_MEMSET   = 0x1DF8;
 constexpr uint32_t ST_GCURPROC = 0x1E00; // GetCurrentProcess
 constexpr uint32_t ST_TERMPROC = 0x1E08; // TerminateProcess
 constexpr uint32_t ST_EH4      = 0x1E10; // _except_handler4_common
+constexpr uint32_t ST_THROW    = 0x1E20; // _CxxThrowException
+constexpr uint32_t ST_RAISE    = 0x1E28; // RaiseException
+constexpr uint32_t ST_CXXFRAME4 = 0x1E30; // __CxxFrameHandler4
+constexpr uint32_t ST_CXXFRAME3 = 0x1E38; // __CxxFrameHandler3
+constexpr uint32_t ST_EH3       = 0x1E40; // _except_handler3
 // kernel32 slack (no export data below 0x1000): CRT-startup API stand-ins
 constexpr uint32_t ST_GSFT   = 0xC00; // GetSystemTimeAsFileTime
 constexpr uint32_t ST_QPC    = 0xC10; // QueryPerformanceCounter
