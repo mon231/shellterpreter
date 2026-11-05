@@ -118,3 +118,101 @@ def test_raw_desc_garbage_raise_x86(tmp_path):
     blob.write_bytes(_x86_desc_blob(MAGIC, GARBAGE))
     r = conftest.run([str(conftest.X86_DIR / "shellterpreter.exe"), str(blob)])
     assert _exit(r) == 0xE0000001, (_exit(r), r.stderr[-2000:])
+
+
+# --- positive path: a raw blob with no PE bytes handles its own raise -------
+
+ST_CSH = 0x1DD0  # __C_specific_handler stand-in, env-relative (guest_environment.hpp)
+
+
+def build_raw_seh_x64():
+    """Blob: register an honest descriptor whose .pdata/unwind info/scope
+    table are hand-built data inside the blob, then RaiseException(1). The
+    scope filter accepts code 1, the handler resumes with eax=0x2A which
+    becomes the exit code. Proves the descriptor contract is complete: the
+    interpreter walks EH metadata it never parsed, declared purely by the
+    guest."""
+    code = bytearray()
+    fixups = []  # (byte offset of rel32, key)
+
+    # top-level: register descriptor, call stub, ret (exit code = eax)
+    code += bytes([0xE8, 0, 0, 0, 0]); fixups.append((len(code) - 4, "L1"))
+    code += bytes([0x41, 0x59])                                        # L1: pop r9 (base+5)
+    code += bytes([0x4D, 0x8B, 0xD1])                                  # mov r10,r9
+    code += bytes([0x65, 0x48, 0x8B, 0x0C, 0x25, 0x30, 0, 0, 0])       # mov rcx,gs:[30h]
+    code += bytes([0x48, 0x81, 0xE9]) + struct.pack("<I", 0x100)       # sub rcx,100h -> env base
+    code += bytes([0x48, 0x8D, 0x89]) + struct.pack("<I", 0x1408)      # lea rcx,[rcx+1408h] -> DESC+8
+    code += bytes([0x49, 0x8D, 0x41, 0xFB])                            # lea rax,[r9-5] -> base
+    code += bytes([0x48, 0x89, 0x01])                                  # mov [rcx],rax      ; imageBase
+    code += bytes([0x49, 0x8D, 0x81]); fixups.append((len(code), "pdata"))
+    code += b"\0\0\0\0"                                                # lea rax,[r9+P-5]
+    code += bytes([0x48, 0x89, 0x41, 0x08])                            # mov [rcx+8],rax    ; pdataVa
+    code += bytes([0xC7, 0x41, 0x10]) + struct.pack("<I", 12)          # pdataSize = 12
+    code += bytes([0xC7, 0x41, 0xFC]) + struct.pack("<I", 0)           # resRva = 0
+    code += bytes([0xC7, 0x41, 0xF8]) + struct.pack("<I", MAGIC)       # commit magic
+    code += bytes([0xE8, 0, 0, 0, 0]); fixups.append((len(code) - 4, "stub"))
+    code += bytes([0xC3])                                              # ret (never reached normally)
+    stub_off = len(code)
+
+    # stub: write the personality slot (needs the runtime env base), raise
+    code += bytes([0x65, 0x48, 0x8B, 0x0C, 0x25, 0x30, 0, 0, 0])       # mov rcx,gs:[30h]
+    code += bytes([0x48, 0x81, 0xE9]) + struct.pack("<I", 0x100)       # sub rcx,100h
+    code += bytes([0x48, 0x8D, 0x89]) + struct.pack("<I", ST_CSH)      # lea rcx,[rcx+ST_CSH]
+    code += bytes([0x49, 0x8D, 0x82]); fixups.append((len(code), "slot"))
+    code += b"\0\0\0\0"                                                # lea rax,[r10+SLOT]
+    code += bytes([0x48, 0x89, 0x08])                                  # mov [rax],rcx      ; slotVal
+    code += bytes([0xB9]) + struct.pack("<I", 1)                       # mov ecx,1 (code)
+    code += bytes([0x31, 0xD2])                                        # xor edx,edx
+    code += bytes([0x45, 0x31, 0xC0])                                  # xor r8d,r8d
+    code += bytes([0x45, 0x31, 0xC9])                                  # xor r9d,r9d
+    code += bytes([0x48, 0x8B, 0x00])                                  # mov rax,[rax]      ; slotVal
+    code += bytes([0x48, 0x05]) + struct.pack("<I", ST_RAISE - ST_CSH) # add rax,raise-csh
+    code += bytes([0xFF, 0xD0])                                        # call rax (RaiseException)
+    code += bytes([0xC3])                                              # ret
+
+    # data section
+    H = len(code)
+    code += bytes([0xFF, 0x25]); fixups.append((len(code), "thunk"))
+    code += b"\0\0\0\0"                                                # FF 25 <SLOT-(H+6)>
+    SLOT = len(code)
+    code += b"\0" * 8                                                  # slot qword, written at runtime
+    FILTER = len(code)
+    code += bytes([0x8B, 0x01])                                        # mov eax,[rcx]   -> EXCEPTION_RECORD
+    code += bytes([0x8B, 0x00])                                        # mov eax,[rax]   -> code
+    code += bytes([0x3D]) + struct.pack("<I", 1)                       # cmp eax,1
+    code += bytes([0x75, 0x06])                                        # jne bad
+    code += bytes([0xB8]) + struct.pack("<I", 1)                       # mov eax,EXECUTE_HANDLER
+    code += bytes([0xC3])                                              # ret
+    code += bytes([0x31, 0xC0])                                        # bad: xor eax,eax (CONTINUE_SEARCH)
+    code += bytes([0xC3])                                              # ret
+    HANDLER = len(code)
+    code += bytes([0xB8]) + struct.pack("<I", 0x2A)                    # mov eax,0x2A
+    code += bytes([0xC3])                                              # ret
+    U = len(code)
+    code += bytes([0x19, 0, 0, 0])                                     # ver=1, flags=EHANDLER|UHANDLER, cnt=0
+    code += struct.pack("<I", H)                                       # handler thunk RVA
+    code += struct.pack("<I", 1)                                       # scope-table count (= dRva slot)
+    code += struct.pack("<IIII", 0, 0x1000, FILTER, HANDLER)           # sb, se, filter, handler
+    P = len(code)
+    code += struct.pack("<III", 0, 0x1000, U)                          # RUNTIME_FUNCTION: begin, end, unwind
+
+    labels = {"stub": stub_off, "pdata": P, "slot": SLOT, "thunk": SLOT - (H + 6)}
+    for off, key in fixups:
+        if key == "L1":
+            struct.pack_into("<i", code, off, 5 - (off + 4))          # pop sits at offset 5
+        elif key == "stub":
+            struct.pack_into("<i", code, off, labels["stub"] - (off + 4))
+        elif key in ("pdata", "slot"):
+            # r10/r9 hold base+5: effective = reg + disp = base+target
+            struct.pack_into("<i", code, off, labels[key] - 5)
+        else:  # thunk: FF 25 rel32 from rip = H+6
+            struct.pack_into("<i", code, off, labels["thunk"])
+    return bytes(code)
+
+
+def test_raw_seh_handled_x64(tmp_path):
+    blob = tmp_path / "raw_seh_x64.shellcode"
+    blob.write_bytes(build_raw_seh_x64())
+    r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(blob)])
+    assert _exit(r) == 0x2A, (_exit(r), r.stderr[-2000:])
+

@@ -70,16 +70,16 @@ def build_raw(is64):
     fixups = []  # (offset of rel32, target label)
 
     if is64:
-        def lea_rax_r9(d):    return bytes([0x49, 0x8D, 0x85]) + struct.pack("<i", d)
-        def lea_r10_r9(d):    return bytes([0x4D, 0x8D, 0x91]) + struct.pack("<i", d)
+        def lea_rax_r8(d):    return bytes([0x49, 0x8D, 0x80]) + struct.pack("<i", d)  # lea rax,[r8+d]
+        def lea_r10_r8(d):    return bytes([0x4D, 0x8D, 0x90]) + struct.pack("<i", d)  # lea r10,[r8+d]
         code += bytes([0xE8, 0, 0, 0, 0])            # call L
         fixups.append((1, "L"))
-        code += bytes([0x41, 0x58])                  # L: pop r9   (r9 = base+5)
+        code += bytes([0x41, 0x58])                  # L: pop r8   (r8 = base+5)
         code += bytes([0x65, 0x48, 0x8B, 0x0C, 0x25, 0x30, 0, 0, 0])  # mov rcx,gs:[30h]
         code += bytes([0x48, 0x8D, 0x89]) + struct.pack("<i", 0x1308)  # lea rcx,[rcx+1308h] -> DESC+8
-        code += lea_rax_r9(img - base)               # lea rax,[r9+img-base]
+        code += lea_rax_r8(img - base)               # lea rax,[r8+img-base]
         code += bytes([0x48, 0x89, 0x01])            # mov [rcx],rax        ; imageBase
-        code += lea_rax_r9(pd - base)
+        code += lea_rax_r8(pd - base)
         code += bytes([0x48, 0x89, 0x41, 0x08])      # mov [rcx+8],rax      ; pdataVa
         code += bytes([0xC7, 0x41, 0x10]) + struct.pack("<I", 0x24)   # pdataSize
         code += bytes([0xC7, 0x41, 0xFC]) + struct.pack("<I", res)    # resRva
@@ -88,11 +88,11 @@ def build_raw(is64):
         code += bytes([0x8B, 0x41, 0xF8]) + bytes([0x3D]) + struct.pack("<I", magic)  # cmp [rcx-8],magic
         code += bytes([0x0F, 0x85, 0, 0, 0, 0]); fixups.append((len(code) - 4, "bad"))
         code += bytes([0x48, 0x8B, 0x01])            # mov rax,[rcx]
-        code += lea_r10_r9(img - base)
+        code += lea_r10_r8(img - base)
         code += bytes([0x4C, 0x39, 0xD0])            # cmp rax,r10
         code += bytes([0x0F, 0x85, 0, 0, 0, 0]); fixups.append((len(code) - 4, "bad"))
         code += bytes([0x48, 0x8B, 0x41, 0x08])      # mov rax,[rcx+8]
-        code += lea_r10_r9(pd - base)
+        code += lea_r10_r8(pd - base)
         code += bytes([0x4C, 0x39, 0xD0])
         code += bytes([0x0F, 0x85, 0, 0, 0, 0]); fixups.append((len(code) - 4, "bad"))
         code += bytes([0x8B, 0x41, 0x10]) + bytes([0x3D]) + struct.pack("<I", 0x24)   # pdataSize
