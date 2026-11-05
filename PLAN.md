@@ -49,16 +49,14 @@ Iterations 1-5 complete (pytest 26 green, Release AND Debug):
 
 Feature track after the rewrite:
 
-- Iteration 6 exceptions (tests 07/11/12/15): x64 table-based first —
-  `RtlAddFunctionTable`/`RtlUnwind*`/`__C_specific_handler`/
-  `_except_handler4_common` stand-ins currently fail closed (`ST_CRTFAIL`),
-  move them from no-op to real; then x86 VEH model. Tests:
-  `07_cpp_exceptions`, `11_cpp_exceptions`, `12_seh_exceptions`,
-  `15_nested_exceptions`. Do not weaken invariants to make exceptions work;
-  if impossible, stop and report.
-- Iteration 7 hardening + docs: fuzz-ish tests, README, final audit;
-  `_initterm`/`_initterm_e` upgrade path from paste-table skip to driven
-  version if tests add C++ static initializers.
+- Iteration 6 exceptions (tests 07/11/12/15): DONE — interpreter-walked
+  unwind (x64 FH4 tables, x86 FS:[0] chain + EH3/SEH3), funclets on a
+  sentinel return, fail closed on uncovered metadata. Commit f07074a.
+- Iteration 7 hardening + docs: DONE — fuzz-ish tests
+  (`tests/pytest/test_iteration7.py`: malformed/truncated/mutated shellcode
+  always ends in a normal result or fault 0xE0000001..9), README exceptions
+  section, final audit clean. `_initterm`/`_initterm_e` upgrade skipped:
+  no test adds C++ static initializers, so the paste-table skip stands.
 
 ## Part 3 — Keynotes
 
