@@ -77,6 +77,13 @@ returns normally it is the low 32 bits of `RAX`/`EAX`; the range
 - **Threads are emulated, join-driven.** `_beginthreadex`/`std::thread`
   stand-ins create emulated threads that run on the first `_Thrd_join`
   stand-in, keeping the interpreter itself single-threaded.
+- **Exceptions are interpreted, not delegated.** Guest C++ (`throw`/`catch`)
+  and SEH (`__try`/`__except`) unwind through metadata the interpreter walks
+  itself: x64 FH4 `.pdata`/`.xdata` tables, x86 `FS:[0]` registration chain
+  with EH3/SEH3 scope tables. Catch handlers and filters run as funclets on a
+  sentinel return address; anything the metadata does not cover (destructor
+  unwind actions, multi-continuation handlers, rethrow) fails closed with a
+  reserved fault code instead of guessing.
 - **A budget instead of a crash.** Instruction execution is bounded;
   default 5,000,000,000, overridable via `SHELLTERP_BUDGET`. A runaway
   guest exits with `0xE0000009` instead of hanging the host process.
