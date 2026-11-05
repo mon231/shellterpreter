@@ -216,3 +216,82 @@ def test_raw_seh_handled_x64(tmp_path):
     r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(blob)])
     assert _exit(r) == 0x2A, (_exit(r), r.stderr[-2000:])
 
+
+# --- positive path: resources declared by a raw blob -----------------------
+
+ST_FIND_RES = 0x1D30  # env-relative stand-in offsets (guest_environment.hpp)
+ST_SIZE_RES = 0x1D40
+
+
+def build_raw_res_x64():
+    """Blob: register a descriptor whose resRva points at a hand-built
+    .rsrc directory tree inside the blob, then FindResourceA(0, id 7, id 10)
+    + SizeofResource directly against the stand-ins. SizeofResource returns
+    the tree's data-entry size (0x2A) which becomes the exit code. Proves
+    the resources side of the descriptor contract with no PE bytes."""
+    code = bytearray()
+    fixups = []  # (byte offset after rel, key) for rel8 jz -> fail
+
+    code += bytes([0xE8, 0, 0, 0, 0]); fixups.append((len(code) - 4, "L1"))
+    code += bytes([0x41, 0x59])                                        # L1: pop r9 (base+5)
+    code += bytes([0x65, 0x48, 0x8B, 0x0C, 0x25, 0x30, 0, 0, 0])       # mov rcx,gs:[30h]
+    code += bytes([0x48, 0x81, 0xE9]) + struct.pack("<I", 0x100)       # sub rcx,100h -> env base
+    code += bytes([0x4C, 0x8B, 0xD1])                                  # mov r10,rcx (env base)
+    code += bytes([0x48, 0x8D, 0x89]) + struct.pack("<I", 0x1408)      # lea rcx,[rcx+1408h] -> DESC+8
+    code += bytes([0x49, 0x8D, 0x41, 0xFB])                            # lea rax,[r9-5] -> base
+    code += bytes([0x48, 0x89, 0x01])                                  # imageBase
+    code += bytes([0x31, 0xC0])                                        # xor eax,eax
+    code += bytes([0x48, 0x89, 0x41, 0x08])                            # pdataVa = 0
+    code += bytes([0xC7, 0x41, 0x10]) + struct.pack("<I", 0)           # pdataSize = 0
+    code += bytes([0xC7, 0x41, 0xFC]); fixups.append((len(code), "res"))
+    code += b"\0\0\0\0"                                                # resRva = R (patched)
+    code += bytes([0xC7, 0x41, 0xF8]) + struct.pack("<I", MAGIC)       # commit magic
+    code += bytes([0x31, 0xC9])                                        # xor ecx,ecx (hModule)
+    code += bytes([0xBA]) + struct.pack("<I", 7)                       # mov edx,7 (name id)
+    code += bytes([0x41, 0xB8]) + struct.pack("<I", 10)                # mov r8d,10 (RT_RCDATA)
+    code += bytes([0x49, 0x8D, 0x82]) + struct.pack("<I", ST_FIND_RES) # lea rax,[r10+FIND]
+    code += bytes([0xFF, 0xD0])                                        # call rax
+    code += bytes([0x48, 0x85, 0xC0])                                  # test rax,rax
+    code += bytes([0x74]); fixups.append((len(code), "fail"))
+    code += b"\0"                                                      # jz fail
+    code += bytes([0x48, 0x89, 0xC2])                                  # mov rdx,rax (handle)
+    code += bytes([0x31, 0xC9])                                        # xor ecx,ecx
+    code += bytes([0x49, 0x8D, 0x82]) + struct.pack("<I", ST_SIZE_RES) # lea rax,[r10+SIZE]
+    code += bytes([0xFF, 0xD0])                                        # call rax
+    code += bytes([0xC3])                                              # ret: exit = eax = size
+    fail_off = len(code)
+    code += bytes([0xB8]) + struct.pack("<I", 0x99)                    # fail: mov eax,0x99
+    code += bytes([0xC3])                                              # ret
+
+    # minimal .rsrc tree, all offsets relative to the tree base R
+    R = (len(code) + 3) & ~3
+    tree = bytearray(12)                                               # dir header (unused)
+    tree += struct.pack("<HH", 0, 1)                                   # named=0, ids=1
+    tree += struct.pack("<II", 10, 0x80000000 | 24)                    # type dir -> name dir @24
+    tree += bytearray(12)
+    tree += struct.pack("<HH", 0, 1)
+    tree += struct.pack("<II", 7, 0x80000000 | 48)                     # name dir -> lang dir @48
+    tree += bytearray(12)
+    tree += struct.pack("<HH", 0, 1)
+    tree += struct.pack("<II", 0x409, 72)                              # lang dir -> data entry @72
+    tree += struct.pack("<II", 0, 0x2A)                                # data entry: DataRVA, Size
+    code += b"\0" * (R - len(code))
+    code += tree
+
+    for off, key in fixups:
+        if key == "L1":
+            struct.pack_into("<i", code, off, 5 - (off + 4))
+        elif key == "res":
+            struct.pack_into("<I", code, off, R)
+        else:  # fail: rel8 from next ip
+            struct.pack_into("<b", code, off, fail_off - off)
+    return bytes(code)
+
+
+def test_raw_resources_x64(tmp_path):
+    blob = tmp_path / "raw_res_x64.shellcode"
+    blob.write_bytes(build_raw_res_x64())
+    r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(blob)])
+    assert _exit(r) == 0x2A, (_exit(r), r.stderr[-2000:])
+
+
