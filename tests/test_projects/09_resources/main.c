@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include "../common/selfreg.h"
 
 typedef void* HRSRC;
 typedef unsigned long DWORD;
@@ -11,6 +12,8 @@ extern __declspec(dllimport) DWORD __stdcall SizeofResource(void* hModule, HRSRC
 
 int main(void)
 {
+    selfRegisterLayout();
+
     HRSRC r = FindResourceA(0, "TESTDATA", RT_RCDATA);
     if (r == 0) return 111;
 

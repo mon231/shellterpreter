@@ -18,12 +18,14 @@ architecture. Embedded `MZ`/`PE` headers in the shellcode are never parsed —
 a blob without any header works fully.
 
 A shellcode that needs image-relative services (x64 table-based exception
-handling, `FindResourceA`/`SizeofResource`) declares its own layout instead:
-it writes a small descriptor block into the emulated environment at a fixed
-offset (magic `'RDSH'`, image base, `.pdata` address/size, resource directory
-RVA — see `kDescRva` in `guest_environment.hpp`). Usually a tiny prologue
-stub does this; the test pipeline bakes one in with `tools/inject_desc.py`.
-A blob that declares nothing still runs — those services simply fail closed.
+handling, `FindResourceA`/`SizeofResource`) registers itself: it writes a
+small descriptor block into the emulated environment at a fixed offset
+(magic `'RDSH'`, image base, `.pdata` address/size, resource directory RVA —
+see `kDescRva` in `guest_environment.hpp`), usually by reading its own
+headers and deriving the runtime image base from a linker-provided symbol.
+`tests/test_projects/common/selfreg.h` is a worked example. The interpreter
+never parses any header — the shellcode owns its bytes, so only it touches
+them. A blob that registers nothing still runs: those services fail closed.
 
 ## Invariants
 

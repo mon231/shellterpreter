@@ -1714,8 +1714,6 @@ private:
                 !memLd<uint64_t>(e, d + 8, imageBase) ||
                 !memLd<uint64_t>(e, d + 0x10, pdataVa) ||
                 !memLd<uint32_t>(e, d + 0x18, pdataSize)) {
-                fprintf(stderr, "[dbg] desc read fail magic=%08x img=%llx pd=%llx sz=%x\n",
-                        magic, (unsigned long long)imageBase, (unsigned long long)pdataVa, pdataSize);
                 ehFail(l); return;
             }
         }
