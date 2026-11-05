@@ -65,6 +65,17 @@ constexpr uint32_t ST_IPP    = 0xC60; // IsProcessorFeaturePresent
 constexpr uint32_t MSVCRT_RVA  = 0x1E00;
 constexpr uint32_t CRTRT_RVA   = 0x1F00;
 
+// Guest-declared layout descriptor (globals with known runtime addresses).
+// The interpreter never parses the shellcode: a shellcode that wants image-
+// relative services (x64 table EH, resources) writes this block itself —
+// usually a tiny prologue stub baked in by the test pipeline for peor blobs.
+// All zero (magic absent) means "not declared": those services fail closed.
+constexpr uint32_t kDescRva   = 0x1400;      // free env range 0x1300..0x1BFF
+constexpr uint32_t kDescMagic = 0x52445348;  // 'RDSH'
+// +0x00 u32 magic | +0x04 u32 resource directory RVA
+// +0x08 u64 image base (runtime VA of image RVA 0)
+// +0x10 u64 .pdata runtime VA (x64 table EH) | +0x18 u32 .pdata byte size
+
 // Guest memory view over any mapped guest region (image, stack, env, heap and
 // each thread's own stack). Returns a host pointer and the bytes remaining
 // from addr to the end of that region; null if addr is outside guest memory.

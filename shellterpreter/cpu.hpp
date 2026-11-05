@@ -441,7 +441,8 @@ private:
         case 0x05: case 0x0D: case 0x15: case 0x1D:
         case 0x25: case 0x2D: case 0x35: case 0x3D: {
             const int fam = (op >> 3) & 7;
-            const uint64_t imm = c.imm64(sz, false);
+            // 64-bit operand size still takes a sign-extended imm32
+            const uint64_t imm = (sz == 8) ? sext(4, f.u32()) : c.imm64(sz, false);
             uint64_t res = 0;
             const uint32_t r = aluOp(c, fam, c.e.r[0], imm, sz, res);
             if (r != fault_code(Fault::None)) return r;
@@ -803,7 +804,8 @@ private:
             return fault_code(Fault::None);
         }
         case 0xA9: {
-            const uint64_t imm = c.imm64(sz, false);
+            // 64-bit operand size still takes an imm32
+            const uint64_t imm = (sz == 8) ? sext(4, f.u32()) : c.imm64(sz, false);
             doLogicOp(c.e, sz, c.e.r[0] & imm);
             return fault_code(Fault::None);
         }
@@ -1431,10 +1433,10 @@ private:
     // on a synthetic sentinel return address. Anything the metadata does not
     // fit the supported shapes is a fail-closed fault, never a guessed resume.
 
-    // Guest VA of an image RVA: the peor blob maps image RVAs 1:1 onto blob
-    // offsets (verified), starting at pe.image_offset.
-    static uint64_t ehGva(Loaded& l, uint64_t rva) {
-        return l.img.base() + l.pe.image_offset + rva;
+    // Guest VA of an image-relative address. The image base is the runtime
+    // value the guest declared in its descriptor, never a parsed header.
+    static uint64_t ehGva(uint64_t imageBase, uint64_t rva) {
+        return imageBase + rva;
     }
 
     static void ehFail(Loaded& l) {
@@ -1484,33 +1486,19 @@ private:
         return true;
     }
 
-    // RUNTIME_FUNCTION for the image RVA of pc (a return address - 1). Also
-    // enforces the RVA==blob-offset identity: every section with raw data must
-    // have PointerToRawData == VirtualAddress, else fail closed.
-    static bool ehFindFunction(Emu& e, Loaded& l, uint64_t pcGuest,
+    // RUNTIME_FUNCTION covering the image RVA of pc (a return address - 1),
+    // found by scanning the .pdata table the guest declared in its descriptor.
+    // No image declared, or pc outside it: false, the frame is skipped.
+    static bool ehFindFunction(Emu& e, uint64_t pcGuest, uint64_t imageBase, uint64_t pdataVa,
+                               uint32_t pdataSize,
                                uint32_t& fnBegin, uint32_t& fnEnd, uint32_t& unwindRva) {
-        const uint64_t img0 = ehGva(l, 0);
-        if (pcGuest < img0) return false;
-        const uint64_t rva = pcGuest - img0;
-        uint32_t lfanew;
-        if (!memLd<uint32_t>(e, img0 + 0x3C, lfanew)) return false;
-        uint32_t sig;
-        if (!memLd<uint32_t>(e, img0 + lfanew, sig) || sig != 0x00004550) return false; // "PE\0\0"
-        uint16_t numSec;
-        if (!memLd<uint16_t>(e, img0 + lfanew + 6, numSec) || numSec == 0 || numSec > 96) return false;
-        uint16_t optSize;
-        if (!memLd<uint16_t>(e, img0 + lfanew + 20, optSize)) return false;
-        uint16_t magic;
-        if (!memLd<uint16_t>(e, img0 + lfanew + 24, magic)) return false;
-        const uint64_t dirBase = img0 + lfanew + 24 + (magic == 0x20B ? 112 : 96);
-        uint32_t pdRva, pdSize;
-        if (!memLd<uint32_t>(e, dirBase + 3 * 8, pdRva) ||
-            !memLd<uint32_t>(e, dirBase + 3 * 8 + 4, pdSize) ||
-            pdRva == 0 || pdSize < 12) return false;
-        const uint32_t n = pdSize / 12;
+        if (imageBase == 0 || pdataVa == 0 || pdataSize < 12) return false;
+        if (pcGuest < imageBase) return false;
+        const uint64_t rva = pcGuest - imageBase;
+        const uint32_t n = pdataSize / 12;
         for (uint32_t i = 0; i < n; ++i) {
             uint32_t b, en, u;
-            const uint64_t e3 = ehGva(l, pdRva) + 12ull * i;
+            const uint64_t e3 = pdataVa + 12ull * i;
             if (!memLd<uint32_t>(e, e3, b) ||
                 !memLd<uint32_t>(e, e3 + 4, en) ||
                 !memLd<uint32_t>(e, e3 + 8, u)) return false;
@@ -1526,9 +1514,9 @@ private:
     //   SEH3:    {next, handler, scopetable, trylevel} - handler = `jmp [IAT
     //            _except_handler3]`, scopetable entries {enclosing, filter,
     //            handler} indexed by trylevel
-    // All metadata fields are link-time VAs (image base 0x400000); the blob is
-    // mapped at img.base()+image_offset, so guest VA = ehGva(rva) with
-    // rva = va - pe.image_base. Stack pointers (nodes, ebp) are runtime VAs.
+    // All metadata fields are link-time VAs; the guest's descriptor gives the
+    // runtime image base, so guest VA = link VA - linkBase + runtimeBase.
+    // Stack pointers (nodes, ebp) are already runtime VAs.
     static void dispatchFrom86(Loaded& l, Emu& e, uint64_t node) {
         while (node != 0) {
             uint32_t next, handler, third;
@@ -1715,43 +1703,58 @@ private:
             dispatchFrom86(l, e, n0);
             return;
         }
-        const uint64_t img0 = ehGva(l, 0);
+        // The guest declares its image layout in the descriptor globals; a
+        // blob that registered nothing has no unwind metadata to walk.
+        uint64_t imageBase = 0, pdataVa = 0;
+        uint32_t pdataSize = 0;
+        {
+            const uint64_t d = e.envBase + kDescRva;
+            uint32_t magic;
+            if (!memLd<uint32_t>(e, d, magic) || magic != kDescMagic ||
+                !memLd<uint64_t>(e, d + 8, imageBase) ||
+                !memLd<uint64_t>(e, d + 0x10, pdataVa) ||
+                !memLd<uint32_t>(e, d + 0x18, pdataSize)) {
+                fprintf(stderr, "[dbg] desc read fail magic=%08x img=%llx pd=%llx sz=%x\n",
+                        magic, (unsigned long long)imageBase, (unsigned long long)pdataVa, pdataSize);
+                ehFail(l); return;
+            }
+        }
         for (uint32_t k = from; k > 0; --k) {
             const uint64_t ret = l.ehLog[k - 1].ret;
             const uint64_t estRsp = l.ehLog[k - 1].rspEntry + 8;
             uint32_t fnBegin, fnEnd, unwindRva;
-            if (!ehFindFunction(e, l, ret - 1, fnBegin, fnEnd, unwindRva)) continue;
-            const uint32_t rva = static_cast<uint32_t>(ret - img0);
+            if (!ehFindFunction(e, ret - 1, imageBase, pdataVa, pdataSize, fnBegin, fnEnd, unwindRva)) continue;
+            const uint64_t rva = ret - 1 - imageBase;
             uint8_t b0;
-            if (!memLd<uint8_t>(e, ehGva(l, unwindRva), b0)) { ehFail(l); return; }
+            if (!memLd<uint8_t>(e, ehGva(imageBase, unwindRva), b0)) { ehFail(l); return; }
             const uint32_t ver = b0 & 7;
             if (ver != 1 && ver != 2) { ehFail(l); return; }
             const uint32_t flags = (b0 >> 3) & 0x1F;
             if (flags & 4) { ehFail(l); return; }   // chained unwind info
             if (!(flags & 3)) continue;             // funclet/leaf: no personality
             uint8_t cnt;
-            if (!memLd<uint8_t>(e, ehGva(l, unwindRva) + 2, cnt)) { ehFail(l); return; }
-            const uint64_t hOff = ehGva(l, unwindRva) + 4 + 2ull * cnt + ((cnt & 1) ? 2 : 0);
+            if (!memLd<uint8_t>(e, ehGva(imageBase, unwindRva) + 2, cnt)) { ehFail(l); return; }
+            const uint64_t hOff = ehGva(imageBase, unwindRva) + 4 + 2ull * cnt + ((cnt & 1) ? 2 : 0);
             uint32_t hRva, dRva;
             if (!memLd<uint32_t>(e, hOff, hRva) ||
                 !memLd<uint32_t>(e, hOff + 4, dRva)) { ehFail(l); return; }
             // personality: thunk `jmp [IAT]` -> slot -> stand-in kind
             uint8_t j0, j1;
-            if (!memLd<uint8_t>(e, ehGva(l, hRva), j0) ||
-                !memLd<uint8_t>(e, ehGva(l, hRva) + 1, j1) ||
+            if (!memLd<uint8_t>(e, ehGva(imageBase, hRva), j0) ||
+                !memLd<uint8_t>(e, ehGva(imageBase, hRva) + 1, j1) ||
                 j0 != 0xFF || j1 != 0x25) { ehFail(l); return; }
             uint32_t relU;
-            if (!memLd<uint32_t>(e, ehGva(l, hRva) + 2, relU)) { ehFail(l); return; }
+            if (!memLd<uint32_t>(e, ehGva(imageBase, hRva) + 2, relU)) { ehFail(l); return; }
             const uint64_t slotRva = hRva + 6 + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(relU)));
             uint64_t slotVal;
-            if (!memLd<uint64_t>(e, ehGva(l, slotRva), slotVal)) { ehFail(l); return; }
+            if (!memLd<uint64_t>(e, ehGva(imageBase, slotRva), slotVal)) { ehFail(l); return; }
             const uint64_t kind = slotVal - l.env.base();
 
             if (l.ehThrow.tiPtr != 0) {
                 // C++ throw: only __CxxFrameHandler4 frames participate (FH3 is x86)
                 if (kind != ST_CXXFRAME4) continue;
                 // FuncInfo4 at dRva
-                uint64_t p = ehGva(l, dRva);
+                uint64_t p = ehGva(imageBase, dRva);
                 uint8_t fh;
                 if (!memLd<uint8_t>(e, p++, fh)) { ehFail(l); return; }
                 if (fh & 0x80) { ehFail(l); return; }          // reserved
@@ -1768,7 +1771,7 @@ private:
                 // current state at the throw point (entries store state+1)
                 uint32_t state = 0xFFFFFFFF; // -1
                 {
-                    uint64_t q = ehGva(l, static_cast<uint32_t>(ip2Rva));
+                    uint64_t q = ehGva(imageBase, static_cast<uint32_t>(ip2Rva));
                     uint32_t n2, prev = 0;
                     if (!eh4ReadUnsigned(e, q, n2)) { ehFail(l); return; }
                     for (uint32_t i = 0; i < n2; ++i) {
@@ -1779,7 +1782,7 @@ private:
                     }
                 }
                 if (tbmRva == 0 || state == 0xFFFFFFFF) continue;
-                uint64_t q = ehGva(l, static_cast<uint32_t>(tbmRva));
+                uint64_t q = ehGva(imageBase, static_cast<uint32_t>(tbmRva));
                 uint32_t nT;
                 if (!eh4ReadUnsigned(e, q, nT)) { ehFail(l); return; }
                 for (uint32_t t = 0; t < nT; ++t) {
@@ -1788,7 +1791,7 @@ private:
                     if (!eh4ReadUnsigned(e, q, lo) || !eh4ReadUnsigned(e, q, hi) ||
                         !eh4ReadUnsigned(e, q, chigh) || !eh4ReadInt(e, q, hArr)) { ehFail(l); return; }
                     if (state < lo || state > hi) continue;
-                    uint64_t hq = ehGva(l, static_cast<uint32_t>(hArr));
+                    uint64_t hq = ehGva(imageBase, static_cast<uint32_t>(hArr));
                     uint32_t nH;
                     if (!eh4ReadUnsigned(e, hq, nH)) { ehFail(l); return; }
                     for (uint32_t h = 0; h < nH; ++h) {
@@ -1820,16 +1823,16 @@ private:
                         uint32_t matchCt = 0;
                         bool match = !hasType; // catch(...)
                         if (hasType) {
-                            const uint32_t tiRva = static_cast<uint32_t>(l.ehThrow.tiPtr - img0);
+                            const uint32_t tiRva = static_cast<uint32_t>(l.ehThrow.tiPtr - imageBase);
                             uint32_t cta;
-                            if (!memLd<uint32_t>(e, ehGva(l, tiRva) + 12, cta)) { ehFail(l); return; }
+                            if (!memLd<uint32_t>(e, ehGva(imageBase, tiRva) + 12, cta)) { ehFail(l); return; }
                             uint32_t nC;
-                            if (!memLd<uint32_t>(e, ehGva(l, cta), nC)) { ehFail(l); return; }
+                            if (!memLd<uint32_t>(e, ehGva(imageBase, cta), nC)) { ehFail(l); return; }
                             for (uint32_t ci = 0; ci < nC && !match; ++ci) {
                                 uint32_t ctRva;
-                                if (!memLd<uint32_t>(e, ehGva(l, cta) + 4 + 4ull * ci, ctRva)) { ehFail(l); return; }
+                                if (!memLd<uint32_t>(e, ehGva(imageBase, cta) + 4 + 4ull * ci, ctRva)) { ehFail(l); return; }
                                 uint32_t td;
-                                if (!memLd<uint32_t>(e, ehGva(l, ctRva) + 4, td)) { ehFail(l); return; }
+                                if (!memLd<uint32_t>(e, ehGva(imageBase, ctRva) + 4, td)) { ehFail(l); return; }
                                 if (td == static_cast<uint32_t>(dispType)) { match = true; matchCt = ctRva; }
                             }
                         }
@@ -1839,8 +1842,8 @@ private:
                         if (hasObj) {
                             int32_t mdisp;
                             uint32_t sz;
-                            if (!memLd<uint32_t>(e, ehGva(l, matchCt) + 8, *reinterpret_cast<uint32_t*>(&mdisp)) ||
-                                !memLd<uint32_t>(e, ehGva(l, matchCt) + 0x14, sz)) { ehFail(l); return; }
+                            if (!memLd<uint32_t>(e, ehGva(imageBase, matchCt) + 8, *reinterpret_cast<uint32_t*>(&mdisp)) ||
+                                !memLd<uint32_t>(e, ehGva(imageBase, matchCt) + 0x14, sz)) { ehFail(l); return; }
                             const uint64_t dst = estRsp + dispCatch;
                             const uint64_t src = l.ehThrow.objEA + static_cast<uint64_t>(mdisp);
                             for (uint32_t by = 0; by < sz; ++by) {
@@ -1858,8 +1861,8 @@ private:
                         l.eh.logMark = k - 1;
                         if (contCount == 1) {
                             l.eh.contKind = 1;
-                            l.eh.contVals[0] = contIsRva ? ehGva(l, cont0)
-                                                         : ehGva(l, fnBegin + cont0);
+                            l.eh.contVals[0] = contIsRva ? ehGva(imageBase, cont0)
+                                                         : ehGva(imageBase, fnBegin + cont0);
                         }
                         e.r[kRSP] = estRsp - 8;
                         if (!memSt<uint64_t>(e, e.r[kRSP], kSentinelSub)) { ehFail(l); return; }
@@ -1868,7 +1871,7 @@ private:
                         // real unwinding restores callee-saved rbp per frame;
                         // Debug continuations address locals via the frame's rbp
                         e.r[kRBP] = l.ehLog[k - 1].rbp;
-                        e.ip = ehGva(l, static_cast<uint32_t>(funclet));
+                        e.ip = ehGva(imageBase, static_cast<uint32_t>(funclet));
                         return;
                     }
                 }
@@ -1911,12 +1914,12 @@ private:
                 l.eh.estRsp = estRsp;
                 l.eh.logMark = k - 1;
                 l.eh.contKind = 1;
-                l.eh.contVals[0] = ehGva(l, sh); // handler resume IP
+                l.eh.contVals[0] = ehGva(imageBase, sh); // handler resume IP
                 e.r[kRSP] = estRsp - 8;
                 if (!memSt<uint64_t>(e, e.r[kRSP], kSentinelSub)) { ehFail(l); return; }
                 e.r[1] = ep;     // rcx = EXCEPTION_POINTERS*
                 e.r[2] = estRsp; // rdx = establisher frame rsp
-                e.ip = ehGva(l, sf);
+                e.ip = ehGva(imageBase, sf);
                 return;
             }
             continue;
@@ -2092,7 +2095,8 @@ private:
     }
 
 public:
-    // Main guest entry: full stack, DLL entry args when the blob is a DLL.
+    // Main guest entry: full stack, sentinel return address. The blob's own
+    // prologue (if any) sets up anything image-specific, e.g. DllMain args.
     static uint32_t runMain(Loaded& l) {
         Emu e;
         initEntry(l, l.stk.base() + l.stk.size(), e);
@@ -2106,21 +2110,6 @@ public:
             if (!memSt<uint32_t>(e, e.r[kRSP], static_cast<uint32_t>(kSentinel))) return fault_code(Fault::OutsideMemory);
         }
         e.ip = l.img.base();
-        if (l.pe.is_dll) {
-            if constexpr (is64) {
-                // DLL entry signature: DllMain(hinst, DLL_PROCESS_ATTACH, nullptr);
-                // hinst = guest address of the image's PE header
-                e.r[1] = l.img.base() + l.pe.image_offset;
-                e.r[2] = 1;
-                e.r[3] = 0;
-            } else {
-                // _DllMainCRTStartup is stdcall ret 12, args above the return address
-                const uint32_t hinst = static_cast<uint32_t>(l.img.base() + l.pe.image_offset);
-                if (!memSt<uint32_t>(e, e.r[kRSP] + 4, hinst) ||
-                    !memSt<uint32_t>(e, e.r[kRSP] + 8, 1) ||
-                    !memSt<uint32_t>(e, e.r[kRSP] + 12, 0)) return fault_code(Fault::OutsideMemory);
-            }
-        }
 
         const uint32_t r = runLoop(e);
         if (r != fault_code(Fault::None) && r != fault_code(Fault::Halt)) return r;

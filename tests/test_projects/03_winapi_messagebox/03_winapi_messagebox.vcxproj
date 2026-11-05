@@ -132,7 +132,7 @@
     <ClCompile Include="main.c" />
   </ItemGroup>
   <ItemDefinitionGroup>
-    <PostBuildEvent Command="peor -i &quot;$(TargetPath)&quot; -o &quot;$(OutDir)$(TargetName).shellcode&quot;" />
+    <PostBuildEvent Command="peor -i &quot;$(TargetPath)&quot; -o &quot;$(OutDir)$(TargetName).shellcode&quot; &amp;&amp; python &quot;$(SolutionDir)tools\inject_desc.py&quot; &quot;$(OutDir)$(TargetName).shellcode&quot;" />
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

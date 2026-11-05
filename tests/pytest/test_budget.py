@@ -4,7 +4,7 @@ import conftest
 
 # jmp $: an endless spin; the ONLY way it stops is the budget fault,
 # so the pin is exact and cannot pass by half-working emulation.
-# Raw (non-PE) bytes default to no architecture: the arch flag is required.
+# Raw (non-PE) bytes: the arch flag picks the core explicitly.
 
 _ARCH = {conftest.X64_DIR: ["--x64"], conftest.X86_DIR: ["--x86"]}
 

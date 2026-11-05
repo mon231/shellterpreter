@@ -12,9 +12,18 @@ address is on the stack when the first instruction runs; emulation ends when
 execution returns to it. That is the full interface: shellterpreter does not
 require [peor](https://pypi.org/project/peor/). Our test corpus uses peor (it
 correctly produces this format), but any hand-crafted or tool-generated
-shellcode following the contract works. If the binary contains an embedded
-`MZ`/`PE` header, it is used for architecture detection only; without one, the
-caller must pass `--x86` or `--x64`.
+shellcode following the contract works. The architecture comes only from the
+caller: `--x86` or `--x64`, defaulting to the interpreter build's own
+architecture. Embedded `MZ`/`PE` headers in the shellcode are never parsed —
+a blob without any header works fully.
+
+A shellcode that needs image-relative services (x64 table-based exception
+handling, `FindResourceA`/`SizeofResource`) declares its own layout instead:
+it writes a small descriptor block into the emulated environment at a fixed
+offset (magic `'RDSH'`, image base, `.pdata` address/size, resource directory
+RVA — see `kDescRva` in `guest_environment.hpp`). Usually a tiny prologue
+stub does this; the test pipeline bakes one in with `tools/inject_desc.py`.
+A blob that declares nothing still runs — those services simply fail closed.
 
 ## Invariants
 
@@ -101,8 +110,9 @@ msbuild shellterpreter.sln /p:Configuration=Release /p:Platform=x86
 ```
 
 `Win_x64\shellterpreter.exe` is a dual-arch interpreter: it contains both the
-x64 and x86 cores and selects them via an embedded PE header or the
-`--x86`/`--x64` flag. `Win_x86\shellterpreter.exe` runs x86 shellcode only.
+x64 and x86 cores and selects them via the `--x86`/`--x64` flag (default =
+the build's own architecture). `Win_x86\shellterpreter.exe` runs x86
+shellcode only.
 GitHub Actions builds both and publishes them as artifacts
 (`shellterpreter-x64`, `shellterpreter-x86`); see
 `.github/workflows/ci.yml`.

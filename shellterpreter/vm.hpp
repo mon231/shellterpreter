@@ -4,7 +4,6 @@
 #include <string>
 #include <vector>
 #include "fault.hpp"
-#include "pe_reader.hpp"
 #include "guest_region.hpp"
 #include "api_table.hpp"
 
@@ -85,15 +84,12 @@ struct Loaded {
     uint32_t ehLogCount = 0;
     EhThrow ehThrow;
     EhPending eh;
-    PeInfo   pe;
     bool     is64;
-    bool     hasImage;
 };
 
-
-// Returns fault_code(Fault::BadFile) when the file cannot be read or is empty. Detection
-// of an embedded PE header is optional; when none is found the buffer starts
-// at offset 0 and the caller picks the architecture explicitly.
+// Returns fault_code(Fault::BadFile) when the file cannot be read or is empty.
+// The blob is opaque: it is mapped verbatim, execution starts at offset 0 and
+// the architecture comes from the caller (--x86/--x64, default = this build).
 uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86);
 
 uint32_t run64(Loaded& l);

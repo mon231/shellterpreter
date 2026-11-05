@@ -10,7 +10,6 @@
 #include "guest_environment.hpp"
 #include "api_standins.hpp"
 #include "shellcode_file.hpp"
-#include "pe_reader.hpp"
 
 namespace stub {
 
@@ -19,19 +18,20 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
     if (!file.open(path)) return fault_code(Fault::BadFile);
     const std::vector<uint8_t>& data = file.bytes();
 
-    PeReader pe_reader;
-    const bool hasImage = pe_reader.scan(data);
-    const uint16_t machine = pe_reader.machine();
+    // The blob is opaque bytes: no header scan, no format assumptions. It is
+    // mapped verbatim, execution starts at offset 0 and the architecture is
+    // whatever the caller asked for. A shellcode that needs image-relative
+    // services (x64 table EH, resources) declares its layout itself by
+    // writing the descriptor globals in the fake environment.
+    out.is64 = !force86;
 
-    // below4: the x86 core addresses guest regions through 32-bit pointers,
-    // so every region must land under 4 GiB when an x86 guest runs.
-    const bool below4 = !out.is64;
+    // below4 always: the x86 core addresses guest regions through 32-bit
+    // pointers, and the stand-ins truncate guest pointers to 32 bits, so
+    // every region must land under 4 GiB in every configuration.
+    const bool below4 = true;
     if (!out.img.allocate(data.size() + 0x10000, below4))
         return fault_code(Fault::Allocation);
     memcpy(out.img.data(), data.data(), data.size());
-    out.pe = pe_reader.info();
-    out.hasImage = hasImage;
-    out.is64 = hasImage ? (machine == 0x8664) : !force86;
 
     const uint64_t stack_size = 4 * 1024 * 1024;
     if (!out.stk.allocate(stack_size, below4))
@@ -66,19 +66,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: shellterpreter.exe <shellcode.bin> [--x86|--x64]\n");
         return fault_code(Fault::Argument);
     }
+#ifdef _WIN64
+    if (arch == 0) arch = 64; // default: this build's own architecture
+#else
+    if (arch == 0) arch = 32;
+#endif
 
     stub::Loaded l{};
     uint32_t err = stub::loadShellcode(path, l, arch == 32);
     if (err != fault_code(Fault::None)) { printFault(err); return static_cast<int>(err); }
-
-    if (!l.hasImage) {
-        if (arch == 0) { printFault(fault_code(Fault::Argument)); return fault_code(Fault::Argument); }
-        l.is64 = (arch == 64);
-    }
-    if (l.hasImage) {
-        if (arch == 32 && l.is64) { printFault(fault_code(Fault::Architecture)); return fault_code(Fault::Architecture); }
-        if (arch == 64 && !l.is64) { printFault(fault_code(Fault::Architecture)); return fault_code(Fault::Architecture); }
-    }
 
 #ifndef _WIN64
     // 32-bit host build runs x86 shellcode only

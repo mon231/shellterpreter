@@ -56,14 +56,14 @@ def test_resources_x86():
 
 
 def test_arch_dispatch():
-    # x64 interpreter runs x86 shellcode
+    # x64 interpreter runs x86 shellcode (explicit flag; headers are not parsed)
     sc = conftest.X86_DIR / "03_winapi_messagebox.shellcode"
     assert sc.exists(), "03_winapi_messagebox.shellcode was not built"
-    r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(sc)])
+    r = conftest.run([str(conftest.X64_DIR / "shellterpreter.exe"), str(sc), "--x86"])
     assert r.returncode == 102, (conftest.win_code(r.returncode), r.stderr[-2000:])
 
-    # x86 interpreter refuses x64 shellcode
+    # x86 interpreter refuses an explicit --x64 request
     sc64 = conftest.X64_DIR / "03_winapi_messagebox.shellcode"
     assert sc64.exists(), "03_winapi_messagebox.shellcode was not built"
-    r = conftest.run([str(conftest.X86_DIR / "shellterpreter.exe"), str(sc64)])
+    r = conftest.run([str(conftest.X86_DIR / "shellterpreter.exe"), str(sc64), "--x64"])
     assert conftest.win_code(r.returncode) == 0xE0000007, (conftest.win_code(r.returncode), r.stderr[-2000:])
