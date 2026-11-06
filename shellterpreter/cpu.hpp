@@ -84,7 +84,7 @@ private:
         int rexW = 0, rexR = 0, rexX = 0, rexB = 0;
         bool op66 = false, rexUsed = false;
         int segGs = 0, segFs = 0;
-        bool rep = false;
+        bool rep = false, repF2 = false;
         uint32_t fault = fault_code(Fault::None);
         MR mr;
         Operand o{ OperandMemory{} };  // r/m operand after decodeRm
@@ -297,7 +297,11 @@ private:
         case 1: { const int64_t v = static_cast<int64_t>(static_cast<int8_t>(a & 0xFF)) * static_cast<int64_t>(static_cast<int8_t>(b & 0xFF)); ovf = (v != static_cast<int64_t>(static_cast<int8_t>(v & 0xFF))); return v; }
         case 2: { const int64_t v = static_cast<int64_t>(static_cast<int16_t>(a & 0xFFFF)) * static_cast<int64_t>(static_cast<int16_t>(b & 0xFFFF)); ovf = (v != static_cast<int64_t>(static_cast<int16_t>(v & 0xFFFF))); return v; }
         case 4: { const int64_t v = static_cast<int64_t>(static_cast<int32_t>(a & 0xFFFFFFFFull)) * static_cast<int64_t>(static_cast<int32_t>(b & 0xFFFFFFFFull)); ovf = (v != static_cast<int64_t>(static_cast<int32_t>(v & 0xFFFFFFFFull))); return v; }
-        default: ovf = -1; return 0;
+        default: {
+            const int64_t v = static_cast<int64_t>(a) * static_cast<int64_t>(b);
+            ovf = (((a ^ static_cast<uint64_t>(v)) & (b ^ static_cast<uint64_t>(v))) >> 63) != 0;
+            return v;
+        }
         }
     }
 
@@ -322,6 +326,16 @@ private:
         const uint64_t nl = ~lo + 1;
         hi = ~hi + (lo == 0);
         lo = nl;
+    }
+
+    // full 64x64 -> 128 unsigned multiply, portable (x86 has no _umul128)
+    static void mul64u(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo) {
+        const uint64_t a0 = a & 0xFFFFFFFFull, a1 = a >> 32;
+        const uint64_t b0 = b & 0xFFFFFFFFull, b1 = b >> 32;
+        const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+        const uint64_t mid = p10 + (p00 >> 32) + (p01 & 0xFFFFFFFFull);
+        lo = (mid << 32) | (p00 & 0xFFFFFFFFull);
+        hi = p11 + (mid >> 32) + (p01 >> 32);
     }
 
     // ---- guest memory ----
@@ -372,6 +386,7 @@ private:
                 else { ++f.pos; }
                 continue;
             case 0xF3: c.rep = true; ++f.pos; continue;
+            case 0xF2: c.rep = true; c.repF2 = true; ++f.pos; continue; // repne for string ops; crc32 marker
             case 0xF0: ++f.pos; continue; // lock: single-threaded, nothing to lock
             case 0x2E: case 0x3E: case 0x26: case 0x36:
                 ++f.pos; continue;
@@ -523,7 +538,6 @@ private:
             const uint64_t a = c.oVal(sz);
             const uint64_t imm = (op == 0x69) ? c.imm64(sz, false) : sext(1, f.u8());
             if (c.fault != fault_code(Fault::None)) return c.fault;
-            if (sz == 8) return fault_code(Fault::UnsupportedInstruction);
             int ovf = 0;
             const int64_t prod = mulSigned(sz, a, imm, ovf);
             const uint64_t res = static_cast<uint64_t>(prod) & maskSz(sz);
@@ -606,7 +620,17 @@ private:
             if (c.fault != fault_code(Fault::None)) return c.fault;
             return fault_code(Fault::None);
         }
-        case 0x8C: case 0x8E: case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+        case 0x8C: case 0x8E: { // sreg moves: reads return a flat 0 selector, writes are no-ops
+            c.decodeRm();
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            if (op == 0x8C) {
+                if (c.oIsReg()) c.castSet(c.oRegIdx(), 2, 0);
+                else { const uint64_t addr = c.eaCalc(); if (!memSt(c.e, addr, static_cast<uint16_t>(0))) c.fault = fault_code(Fault::OutsideMemory); }
+            }
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            return fault_code(Fault::None);
+        }
+        case 0xD8: case 0xD9: case 0xDA: case 0xDB:
         case 0xDC: case 0xDD: case 0xDE: case 0xDF:
             return fault_code(Fault::UnsupportedInstruction);
         case 0x8D: {
@@ -635,16 +659,26 @@ private:
             c.e.r[idx & 15] = ra;
             return fault_code(Fault::None);
         }
-        case 0x98: {
-            if (c.op66) return fault_code(Fault::UnsupportedInstruction);
-            if (c.rexW) { const uint64_t v = sext(4, c.e.r[0]); c.e.r[0] = v; }
-            else { const uint64_t v = sext(2, c.e.r[0] & 0xFFFF); c.e.r[0] = (c.e.r[0] & ~0xFFFFFFFFull) | v; }
+        case 0x98: { // cbw/cwde/cdqe
+            if (is64) {
+                if (c.rexW) { c.e.r[0] = sext(4, c.e.r[0]); }
+                else c.e.r[0] = (c.e.r[0] & ~0xFFFFFFFFull) | sext(2, c.e.r[0] & 0xFFFF);
+            } else if (c.op66) {
+                c.e.r[0] = (c.e.r[0] & ~0xFFFFFFFFull) | sext(2, c.e.r[0] & 0xFFFF);
+            } else {
+                c.e.r[0] = (c.e.r[0] & ~0xFFFFull) | sext(1, c.e.r[0] & 0xFF);
+            }
             return fault_code(Fault::None);
         }
-        case 0x99: {
-            if (c.op66) return fault_code(Fault::UnsupportedInstruction);
-            if (c.rexW) c.e.r[2] = (c.e.r[0] & 0x8000000000000000ull) ? ~0ull : 0;
-            else c.e.r[2] = (c.e.r[0] & 0x80000000ull) ? 0xFFFFFFFFull : 0;
+        case 0x99: { // cwd/cdq/cqo
+            if (is64) {
+                if (c.rexW) c.e.r[2] = (c.e.r[0] & 0x8000000000000000ull) ? ~0ull : 0;
+                else c.e.r[2] = (c.e.r[0] & 0x80000000ull) ? 0xFFFFFFFFull : 0;
+            } else if (c.op66) {
+                c.e.r[2] = (c.e.r[0] & 0x80000000ull) ? 0xFFFFFFFFull : 0;
+            } else {
+                c.e.r[2] = (c.e.r[0] & 0x8000ull) ? 0xFFFFull : 0;
+            }
             return fault_code(Fault::None);
         }
         case 0x9C: {
@@ -664,6 +698,22 @@ private:
             c.e.sf = (fl & 0x80) != 0;
             c.e.df = (fl & 0x400) != 0;
             c.e.of = (fl & 0x800) != 0;
+            return fault_code(Fault::None);
+        }
+        case 0x9F: { // lahf: ah = sf zf 0 af 0 pf 1 cf
+            const uint64_t b = (c.e.sf ? 0x80 : 0) | (c.e.zf ? 0x40 : 0) |
+                               (c.e.af ? 0x10 : 0) | (c.e.pf ? 4 : 0) | 2 |
+                               (c.e.cf ? 1 : 0);
+            c.e.r[0] = (c.e.r[0] & ~0xFF00ull) | (b << 8);
+            return fault_code(Fault::None);
+        }
+        case 0x9E: { // sahf
+            const uint64_t ah = (c.e.r[0] >> 8) & 0xFF;
+            c.e.sf = (ah & 0x80) != 0;
+            c.e.zf = (ah & 0x40) != 0;
+            c.e.af = (ah & 0x10) != 0;
+            c.e.pf = (ah & 0x04) != 0;
+            c.e.cf = (ah & 0x01) != 0;
             return fault_code(Fault::None);
         }
         case 0xA0: case 0xA1: case 0xA2: case 0xA3: {
@@ -735,11 +785,76 @@ private:
                     if (c.e.r[1] == 0) break;
                 }
                 return fault_code(Fault::None);
+            } else { // x86: same loop, 32-bit truncated addressing
+                const int szCode = (op == 0xA4 || op == 0xAA) ? 1 : (c.op66 ? 2 : 4);
+                const int stepv = c.e.df ? -szCode : szCode;
+                const bool mov = (op == 0xA4 || op == 0xA5);
+                if (c.rep && c.e.r[1] == 0) return fault_code(Fault::None);
+                for (;;) {
+                    if (c.e.budget == 0) return fault_code(Fault::Budget);
+                    --c.e.budget;
+                    const uint64_t si = c.e.r[6] & maskSz(4), di = c.e.r[7] & maskSz(4);
+                    uint64_t v = c.e.r[0] & maskSz(szCode);
+                    if (mov) {
+                        if (szCode == 1) { uint8_t t; if (!memLd(c.e, si, t)) return fault_code(Fault::OutsideMemory); v = t; }
+                        else if (szCode == 2) { uint16_t t; if (!memLd(c.e, si, t)) return fault_code(Fault::OutsideMemory); v = t; }
+                        else { uint32_t t; if (!memLd(c.e, si, t)) return fault_code(Fault::OutsideMemory); v = t; }
+                        c.e.r[6] = (si + static_cast<uint64_t>(stepv)) & maskSz(4);
+                    }
+                    if (szCode == 1) { if (!memSt(c.e, di, static_cast<uint8_t>(v))) return fault_code(Fault::OutsideMemory); }
+                    else if (szCode == 2) { if (!memSt(c.e, di, static_cast<uint16_t>(v))) return fault_code(Fault::OutsideMemory); }
+                    else { if (!memSt(c.e, di, static_cast<uint32_t>(v))) return fault_code(Fault::OutsideMemory); }
+                    c.e.r[7] = (di + static_cast<uint64_t>(stepv)) & maskSz(4);
+                    if (!c.rep) break;
+                    --c.e.r[1];
+                    if (c.e.r[1] == 0) break;
+                }
+                return fault_code(Fault::None);
             }
-            return fault_code(Fault::UnsupportedInstruction);
         }
-        case 0xAE:
-            return fault_code(Fault::UnsupportedInstruction);
+        case 0xAE: case 0xAF: { // scas: compare al/ax/eax/rax with [rdi], rdi steps
+            if constexpr (is64) {
+                const int szCode = (op == 0xAE) ? 1 : (c.op66 ? 2 : (c.rexW ? 8 : 4));
+                const int stepv = c.e.df ? -szCode : szCode;
+                if (c.rep && c.e.r[1] == 0) return fault_code(Fault::None);
+                for (;;) {
+                    if (c.e.budget == 0) return fault_code(Fault::Budget);
+                    --c.e.budget;
+                    const uint64_t di = c.e.r[7];
+                    const uint64_t a = c.e.r[0] & maskSz(szCode);
+                    uint64_t b = 0;
+                    if (szCode == 1) { uint8_t t; if (!memLd(c.e, di, t)) return fault_code(Fault::OutsideMemory); b = t; }
+                    else if (szCode == 2) { uint16_t t; if (!memLd(c.e, di, t)) return fault_code(Fault::OutsideMemory); b = t; }
+                    else if (szCode == 4) { uint32_t t; if (!memLd(c.e, di, t)) return fault_code(Fault::OutsideMemory); b = t; }
+                    else { if (!memLd(c.e, di, b)) return fault_code(Fault::OutsideMemory); }
+                    doSubF(c.e, szCode, a, b);
+                    c.e.r[7] = di + static_cast<uint64_t>(stepv);
+                    if (!c.rep) break;
+                    --c.e.r[1];
+                    if (c.e.r[1] == 0 || (c.repF2 ? c.e.zf : !c.e.zf)) break;
+                }
+            } else {
+                const int szCode = (op == 0xAE) ? 1 : (c.op66 ? 2 : 4);
+                const int stepv = c.e.df ? -szCode : szCode;
+                if (c.rep && c.e.r[1] == 0) return fault_code(Fault::None);
+                for (;;) {
+                    if (c.e.budget == 0) return fault_code(Fault::Budget);
+                    --c.e.budget;
+                    const uint64_t di = c.e.r[7] & 0xFFFFFFFFull;
+                    const uint64_t a = c.e.r[0] & maskSz(szCode);
+                    uint64_t b = 0;
+                    if (szCode == 1) { uint8_t t; if (!memLd(c.e, di, t)) return fault_code(Fault::OutsideMemory); b = t; }
+                    else if (szCode == 2) { uint16_t t; if (!memLd(c.e, di, t)) return fault_code(Fault::OutsideMemory); b = t; }
+                    else { uint32_t t; if (!memLd(c.e, di, t)) return fault_code(Fault::OutsideMemory); b = t; }
+                    doSubF(c.e, szCode, a, b);
+                    c.e.r[7] = (di + static_cast<uint64_t>(stepv)) & 0xFFFFFFFFull;
+                    if (!c.rep) break;
+                    --c.e.r[1];
+                    if (c.e.r[1] == 0 || (c.repF2 ? c.e.zf : !c.e.zf)) break;
+                }
+            }
+            return fault_code(Fault::None);
+        }
         case 0xA6: case 0xA7: {
             if constexpr (is64) {
                 const int szCode = (op == 0xA6) ? 1 : (c.op66 ? 2 : (c.rexW ? 8 : 4));
@@ -837,7 +952,30 @@ private:
             uint64_t res = a;
             if (count != 0) {
                 const int kind = c.mr.reg;
-                if (kind == 0 || kind == 1 || kind == 2 || kind == 3) return fault_code(Fault::UnsupportedInstruction);
+                if (kind <= 3) {
+                    // rol/ror/rcl/rcr: only cf/of change; count already masked
+                    uint64_t v = a, cf = c.e.cf ? 1 : 0;
+                    for (uint64_t i = 0; i < count; ++i) {
+                        if (kind == 0) { // rol
+                            cf = (v >> (bits - 1)) & 1; v = ((v << 1) | cf) & m;
+                        } else if (kind == 1) { // ror
+                            cf = v & 1; v = (v >> 1) | (cf << (bits - 1));
+                        } else if (kind == 2) { // rcl
+                            const uint64_t nc = (v >> (bits - 1)) & 1; v = ((v << 1) | cf) & m; cf = nc;
+                        } else { // rcr
+                            const uint64_t nc = v & 1; v = (v >> 1) | (cf << (bits - 1)); cf = nc;
+                        }
+                    }
+                    res = v;
+                    c.e.cf = cf != 0;
+                    if (count == 1) {
+                        if (kind == 0) c.e.of = ((res >> (bits - 1)) & 1) != (c.e.cf);
+                        else if (kind == 1) c.e.of = (((res >> (bits - 1)) & 1) != ((res >> (bits - 2)) & 1));
+                    }
+                    if (osz == 1) c.o8Write(res); else c.oSet(osz, res);
+                    if (c.fault != fault_code(Fault::None)) return c.fault;
+                    return fault_code(Fault::None);
+                }
                 if (kind == 4 || kind == 6) {
                     res = (a << count) & m;
                     c.e.cf = (count >= bits) ? false : ((a >> (bits - count)) & 1) != 0;
@@ -896,7 +1034,9 @@ private:
             c.e.r[5] = v;
             return fault_code(Fault::None);
         }
-        case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+        case 0xCC:
+            return fault_code(Fault::None); // int3: no debugger to raise inside the box
+        case 0xCA: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
         case 0xE4: case 0xE5: case 0xE6: case 0xE7:
         case 0xEE: case 0xEF: case 0xF1:
             return fault_code(Fault::UnsupportedInstruction);
@@ -1016,7 +1156,11 @@ private:
             case 2: c.oSet(sz, ~a & maskSz(sz)); if (c.fault != fault_code(Fault::None)) return c.fault; return fault_code(Fault::None);
             case 3: c.oSet(sz, doNegOp(c.e, sz, a)); if (c.fault != fault_code(Fault::None)) return c.fault; return fault_code(Fault::None);
             case 4: {
-                if (sz == 8) return fault_code(Fault::UnsupportedInstruction);
+                if (sz == 8) {
+                    mul64u(c.e.r[0], a, c.e.r[2], c.e.r[0]);
+                    c.e.cf = c.e.of = c.e.r[2] != 0;
+                    return fault_code(Fault::None);
+                }
                 const uint64_t p = (c.e.r[0] & maskSz(sz)) * (a & maskSz(sz));
                 c.e.r[0] = p & maskSz(sz);
                 const uint64_t hi = (p >> bitsSz(sz)) & maskSz(sz);
@@ -1025,7 +1169,18 @@ private:
                 return fault_code(Fault::None);
             }
             case 5: {
-                if (sz == 8) return fault_code(Fault::UnsupportedInstruction);
+                if (sz == 8) {
+                    const bool neg = (static_cast<int64_t>(c.e.r[0]) < 0) != (static_cast<int64_t>(a) < 0);
+                    const uint64_t ua = static_cast<int64_t>(c.e.r[0]) < 0 ? ~c.e.r[0] + 1 : c.e.r[0];
+                    const uint64_t ub = static_cast<int64_t>(a) < 0 ? ~a + 1 : a;
+                    uint64_t hi, lo;
+                    mul64u(ua, ub, hi, lo);
+                    if (neg) neg128(hi, lo);
+                    c.e.r[0] = lo;
+                    c.e.r[2] = hi;
+                    c.e.cf = c.e.of = (hi != static_cast<uint64_t>(static_cast<int64_t>(lo) >> 63));
+                    return fault_code(Fault::None);
+                }
                 int ovf = 0;
                 const int64_t p = mulSigned(sz, c.e.r[0], a, ovf);
                 (void)ovf;
@@ -1377,7 +1532,6 @@ private:
                 if (c.fault != fault_code(Fault::None)) return c.fault;
                 const uint64_t a = c.oVal(sz);
                 if (c.fault != fault_code(Fault::None)) return c.fault;
-                if (sz == 8) return fault_code(Fault::UnsupportedInstruction);
                 int ovf = 0;
                 const int64_t prod = mulSigned(sz, c.gVal(sz), a, ovf);
                 const uint64_t res = static_cast<uint64_t>(prod) & maskSz(sz);
@@ -1385,6 +1539,106 @@ private:
                 c.gSet(sz, res);
                 if (c.fault != fault_code(Fault::None)) return c.fault;
                 return fault_code(Fault::None);
+            }
+            case 0xA4: case 0xA5: case 0xAC: case 0xAD: { // shld/shrd r/m, r, imm8|cl
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                const uint64_t dst0 = c.oVal(sz);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                const uint64_t src = c.gVal(sz);
+                uint64_t count = (op2 == 0xA4 || op2 == 0xAC) ? f.u8() : c.e.r[1] & 0xFF;
+                count &= (sz == 8) ? 0x3F : 0x1F;
+                if (count != 0) {
+                    const uint64_t m = maskSz(sz), bits = bitsSz(sz);
+                    const bool left = (op2 == 0xA4 || op2 == 0xA5);
+                    if (count > bits) count = bits; // count > width is undefined; src fills dst
+                    uint64_t res;
+                    if (left) {
+                        res = ((dst0 << count) | (src >> (bits - count))) & m;
+                        c.e.cf = (src >> (bits - count)) & 1;
+                    } else {
+                        res = ((dst0 >> count) | (src << (bits - count))) & m;
+                        c.e.cf = (dst0 >> (count - 1)) & 1;
+                    }
+                    c.e.of = (count == 1) ? (((res ^ dst0) >> (bits - 1)) & 1) != 0 : false;
+                    flagsNZP(c.e, sz, res);
+                    c.oSet(sz, res);
+                    if (c.fault != fault_code(Fault::None)) return c.fault;
+                }
+                return fault_code(Fault::None);
+            }
+            case 0xB8: { // F3 0F B8 = popcnt; otherwise not supported
+                if (!c.rep || c.repF2) return fault_code(Fault::UnsupportedInstruction);
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                uint64_t s = c.oVal(sz);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                uint64_t p = 0;
+                while (s) { p += s & 1; s >>= 1; }
+                flagsNZP(c.e, sz, p);
+                c.gSet(sz, p);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                return fault_code(Fault::None);
+            }
+            case 0x38: { // three-byte escape: F2 0F 38 F0/F1 = crc32
+                const uint8_t op3 = f.u8();
+                if (op3 != 0xF0 && op3 != 0xF1) return fault_code(Fault::UnsupportedInstruction);
+                if (!c.repF2) return fault_code(Fault::UnsupportedInstruction);
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                const int osz = (op3 == 0xF0) ? 1 : (c.rexW && is64) ? 8 : (c.op66 ? 2 : 4);
+                const int nbytes = osz;
+                const uint64_t s = c.oVal(osz);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                constexpr uint32_t kCrcPoly = 0x82F63B78u; // reversed Castagnoli
+                uint32_t crc = ~static_cast<uint32_t>(c.e.r[0]);
+                for (int i = 0; i < nbytes; ++i) {
+                    crc ^= static_cast<uint32_t>((s >> (8 * i)) & 0xFF);
+                    for (int b = 0; b < 8; ++b)
+                        crc = (crc >> 1) ^ (kCrcPoly & (0u - (crc & 1)));
+                }
+                crc = ~crc;
+                const int dsz = (c.rexW && is64) ? 8 : 4;
+                c.gSet(dsz, crc);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                return fault_code(Fault::None);
+            }
+            case 0xBC: case 0xBD: { // bsf/bsr
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                const uint64_t s = c.oVal(sz);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                c.e.zf = s == 0;
+                if (s != 0) {
+                    uint64_t idx = 0;
+                    if (op2 == 0xBC) { while (((s >> idx) & 1) == 0) ++idx; }
+                    else { idx = bitsSz(sz) - 1; while (((s >> idx) & 1) == 0) --idx; }
+                    c.gSet(sz, idx);
+                    if (c.fault != fault_code(Fault::None)) return c.fault;
+                }
+                return fault_code(Fault::None);
+            }
+            case 0xC0: case 0xC1: { // xadd
+                const int osz = (op2 == 0xC0) ? 1 : sz;
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                const uint64_t a = (osz == 1) ? c.o8Read() : c.oVal(osz);
+                const uint64_t b = (osz == 1) ? c.g8Read() : c.gVal(osz);
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                uint64_t sum = 0;
+                aluOp(c, 0, a, b, osz, sum);
+                if (osz == 1) { c.g8Write(a); c.o8Write(sum); }
+                else { c.gSet(osz, a); c.oSet(osz, sum); }
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                return fault_code(Fault::None);
+            }
+            case 0xA0: case 0xA1: case 0xA8: case 0xA9: { // push/pop fs/gs: flat zero selector
+                (void)c.op66;
+                if (op2 == 0xA0 || op2 == 0xA8)
+                    return push64(c.e, 0) ? fault_code(Fault::None) : fault_code(Fault::OutsideMemory);
+                uint64_t v = 0;
+                if (!pop64(c.e, v)) return fault_code(Fault::OutsideMemory);
+                return fault_code(Fault::None); // loading a selector is a no-op here
             }
             case 0xB6: case 0xB7: {
                 c.decodeRm();
