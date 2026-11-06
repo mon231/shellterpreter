@@ -1,9 +1,10 @@
-#pragma once
+﻿#pragma once
 #include "vm.hpp"
 #include "guest_environment.hpp"
 #include "instruction_decoder.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -336,6 +337,543 @@ private:
         const uint64_t mid = p10 + (p00 >> 32) + (p01 & 0xFFFFFFFFull);
         lo = (mid << 32) | (p00 & 0xFFFFFFFFull);
         hi = p11 + (mid >> 32) + (p01 >> 32);
+    }
+
+    // ---- SSE helpers (batch B) ----
+    // prefix kinds: 0 = none/ps (2x f32), 1 = F3/ss, 2 = 66/pd (2x f64), 3 = F2/sd
+    static uint64_t dto(double d) { uint64_t b; memcpy(&b, &d, 8); return b; }
+    static double dfrom(uint64_t b) { double d; memcpy(&d, &b, 8); return d; }
+    static uint32_t fto(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
+    static float ffrom(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
+
+    // xmm source for a packed/scalar op: mem forms load only the operand size
+    // the real instruction reads (upper destination lanes stay untouched)
+    static bool sseSrc(Ctx& c, uint64_t src[2], int kind) {
+        if (c.oIsReg()) {
+            const int s = (c.mr.rm | (c.rexB << 3)) & 15;
+            src[0] = c.e.xmm[s][0];
+            src[1] = c.e.xmm[s][1];
+            return true;
+        }
+        const uint64_t ea = c.eaCalc();
+        if (kind == 1) { uint32_t t = 0; if (!memLd(c.e, ea, t)) return false; src[0] = t; src[1] = 0; return true; }
+        if (kind == 0 || kind == 3) { uint64_t t = 0; if (!memLd(c.e, ea, t)) return false; src[0] = t; src[1] = 0; return true; }
+        return memLd<uint64_t>(c.e, ea, src[0]) && memLd<uint64_t>(c.e, ea + 8, src[1]);
+    }
+
+    // binary packed/scalar float family: add/sub/mul/div/min/max/sqrt/rcp/rsqrt
+    // + bitwise and/andn/or/xor. Scalar kinds touch only the lowest element.
+    static uint32_t sseBin(Ctx& c, uint8_t op2) {
+        const int kind = c.repF2 ? 3 : c.rep ? 1 : c.op66 ? 2 : 0;
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.gRegIdx() & 15;
+        uint64_t src[2] = { 0, 0 };
+        if (!sseSrc(c, src, kind)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        const uint64_t d0 = c.e.xmm[dst][0], d1 = c.e.xmm[dst][1];
+        if (op2 == 0x54 || op2 == 0x55 || op2 == 0x56 || op2 == 0x57) {
+            // bitwise: resolved byte width per kind (ss/pd semantics)
+            const uint64_t mLo = (kind == 1) ? 0xFFFFFFFFull : ~0ull;
+            const uint64_t s0 = src[0] & mLo, dd0 = d0 & mLo;
+            uint64_t r0;
+            if (op2 == 0x54) r0 = dd0 & s0;
+            else if (op2 == 0x55) r0 = (~dd0) & s0; // andnps: dst = ~dst & src
+            else if (op2 == 0x56) r0 = dd0 | s0;
+            else r0 = dd0 ^ s0;
+            c.e.xmm[dst][0] = (d0 & ~mLo) | r0;
+            if (kind == 2) c.e.xmm[dst][1] = (op2 == 0x54) ? (d1 & src[1]) : (op2 == 0x55) ? ((~d1) & src[1]) : (op2 == 0x56) ? (d1 | src[1]) : (d1 ^ src[1]);
+            return fault_code(Fault::None);
+        }
+        const int ln = (kind == 0 || kind == 2) ? 2 : 1;
+        uint64_t res[2] = { d0, d1 };
+        for (int i = 0; i < ln; ++i) {
+            if (kind < 2) {
+                const uint32_t sb = static_cast<uint32_t>(src[0] >> (32 * i));
+                uint32_t r;
+                switch (op2) {
+                case 0x51: r = fto(sqrtf(ffrom(sb))); break;
+                case 0x52: r = fto(1.0f / sqrtf(ffrom(sb))); break;
+                case 0x53: r = fto(1.0f / ffrom(sb)); break;
+                case 0x58: r = fto(ffrom(static_cast<uint32_t>(d0 >> (32 * i))) + ffrom(sb)); break;
+                case 0x59: r = fto(ffrom(static_cast<uint32_t>(d0 >> (32 * i))) * ffrom(sb)); break;
+                case 0x5C: r = fto(ffrom(static_cast<uint32_t>(d0 >> (32 * i))) - ffrom(sb)); break;
+                case 0x5E: r = fto(ffrom(static_cast<uint32_t>(d0 >> (32 * i))) / ffrom(sb)); break;
+                case 0x5D: r = fto(fminf(ffrom(static_cast<uint32_t>(d0 >> (32 * i))), ffrom(sb))); break;
+                case 0x5F: r = fto(fmaxf(ffrom(static_cast<uint32_t>(d0 >> (32 * i))), ffrom(sb))); break;
+                default: return fault_code(Fault::UnsupportedInstruction);
+                }
+                res[0] = (res[0] & ~(0xFFFFFFFFull << (32 * i))) | (static_cast<uint64_t>(r) << (32 * i));
+            } else {
+                const double b = dfrom(src[i]);
+                const double a = dfrom(res[i]);
+                double r;
+                switch (op2) {
+                case 0x51: r = sqrt(b); break;
+                case 0x52: r = 1.0 / sqrt(b); break;
+                case 0x53: r = 1.0 / b; break;
+                case 0x58: r = a + b; break;
+                case 0x59: r = a * b; break;
+                case 0x5C: r = a - b; break;
+                case 0x5E: r = a / b; break;
+                case 0x5D: r = fmin(a, b); break;
+                case 0x5F: r = fmax(a, b); break;
+                default: return fault_code(Fault::UnsupportedInstruction);
+                }
+                res[i] = dto(r);
+            }
+        }
+        c.e.xmm[dst][0] = res[0];
+        if (kind == 2) c.e.xmm[dst][1] = res[1];
+        return fault_code(Fault::None);
+    }
+
+    // cvt group: 0F 5A/5B/E6 (float<->int, ps<->pd); kind = sse prefix kind by op2
+    //   5A: ps->pd (none), ss->sd (F3), sd->ss (F2), pd->ps (66)
+    //   5B: dq->ps (none), ps->dq round (66), ps->dq trunc (F3)
+    //   E6: dq->pd (F2), pd->dq round (66), pd->dq trunc (F3)
+    static uint32_t sseCvtFlt(Ctx& c, uint8_t op2) {
+        const int kind = c.repF2 ? 3 : c.rep ? 1 : c.op66 ? 2 : 0;
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.gRegIdx() & 15;
+        uint64_t src[2];
+        if (!sseSrc(c, src, kind)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        const uint64_t d0 = c.e.xmm[dst][0];
+        switch (op2) {
+        case 0x5A: {
+            if (kind == 0) { // ps -> pd
+                c.e.xmm[dst][0] = dto(static_cast<double>(ffrom(static_cast<uint32_t>(src[0]))));
+                c.e.xmm[dst][1] = dto(static_cast<double>(ffrom(static_cast<uint32_t>(src[0] >> 32))));
+            } else if (kind == 2) { // pd -> ps
+                const uint32_t lo = fto(dfrom(src[0]));
+                const uint32_t hi = fto(dfrom(src[1]));
+                c.e.xmm[dst][0] = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+            } else if (kind == 1) { // ss -> sd
+                c.e.xmm[dst][0] = dto(static_cast<double>(ffrom(static_cast<uint32_t>(src[0]))));
+            } else { // sd -> ss
+                c.e.xmm[dst][0] = (d0 & ~0xFFFFFFFFull) | fto(dfrom(src[0]));
+            }
+            return fault_code(Fault::None);
+        }
+        case 0x5B: {
+            if (kind == 0) { // dq2ps
+                const float a = static_cast<float>(static_cast<int32_t>(src[0]));
+                const float b = static_cast<float>(static_cast<int32_t>(src[0] >> 32));
+                c.e.xmm[dst][0] = static_cast<uint64_t>(fto(a)) | (static_cast<uint64_t>(fto(b)) << 32);
+            } else if (kind == 2) { // ps2dq round; dst upper zero
+                const int32_t a = static_cast<int32_t>(lrintf(ffrom(static_cast<uint32_t>(src[0]))));
+                const int32_t b = static_cast<int32_t>(lrintf(ffrom(static_cast<uint32_t>(src[0] >> 32))));
+                c.e.xmm[dst][0] = static_cast<uint64_t>(static_cast<uint32_t>(a)) |
+                                  (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32);
+                c.e.xmm[dst][1] = 0;
+            } else if (kind == 1) { // cvttps2dq trunc; dst upper zero
+                const int32_t a = static_cast<int32_t>(ffrom(static_cast<uint32_t>(src[0])));
+                const int32_t b = static_cast<int32_t>(ffrom(static_cast<uint32_t>(src[0] >> 32)));
+                c.e.xmm[dst][0] = static_cast<uint64_t>(static_cast<uint32_t>(a)) |
+                                  (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32);
+                c.e.xmm[dst][1] = 0;
+            } else return fault_code(Fault::UnsupportedInstruction);
+            return fault_code(Fault::None);
+        }
+        case 0xE6: {
+            if (kind == 3) { // dq2pd: 2 s32 lanes -> 2 f64
+                c.e.xmm[dst][0] = dto(static_cast<double>(static_cast<int32_t>(src[0])));
+                c.e.xmm[dst][1] = dto(static_cast<double>(static_cast<int32_t>(src[0] >> 32)));
+            } else if (kind == 2) { // pd2dq round; low lane kept, upper zero
+                c.e.xmm[dst][0] = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(lrint(dfrom(src[0])))));
+                c.e.xmm[dst][1] = 0;
+            } else if (kind == 1) { // cvttpd2dq trunc
+                c.e.xmm[dst][0] = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(dfrom(src[0]))));
+                c.e.xmm[dst][1] = 0;
+            } else return fault_code(Fault::UnsupportedInstruction);
+            return fault_code(Fault::None);
+        }
+        default: return fault_code(Fault::UnsupportedInstruction);
+        }
+    }
+
+    // 0F 2A (si -> ss/sd with F3/F2) and 0F 2C/2D (ss/sd -> si with F3/F2)
+    // The GPR source is signed; x64 REX.W stays 64-bit. Out-of-range float->int
+    // is hardware "integer indefinite" (INT_MIN) - never guessed otherwise.
+    static uint32_t sseCvtInt(Ctx& c, uint8_t op2) {
+        if (op2 != 0x2A && !(c.rep || c.repF2)) return fault_code(Fault::UnsupportedInstruction);
+        const int fkind = c.repF2 ? 3 : 1; // ss or sd
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        if (op2 == 0x2A) {
+            const int dst = c.gRegIdx() & 15;
+            const int isz = (c.rexW && is64) ? 8 : 4;
+            const int64_t sv = (isz == 8) ? static_cast<int64_t>(c.oVal(8)) : static_cast<int32_t>(c.oVal(4));
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            if (c.repF2) c.e.xmm[dst][0] = dto(static_cast<double>(sv));
+            else c.e.xmm[dst][0] = (c.e.xmm[dst][0] & ~0xFFFFFFFFull) | fto(static_cast<float>(sv));
+            return fault_code(Fault::None);
+        }
+        uint64_t src[2];
+        if (!sseSrc(c, src, fkind)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        const double v = (fkind == 1) ? static_cast<double>(ffrom(static_cast<uint32_t>(src[0]))) : dfrom(src[0]);
+        const int osz = (c.rexW && is64) ? 8 : 4;
+        const double lo = (osz == 4) ? -2147483648.0 : -9223372036854775808.0;
+        const double hi = (osz == 4) ? 2147483648.0 : 9223372036854775808.0;
+        const bool bad = !(v >= lo && v < hi);
+        if (bad) {
+            // integer indefinite: INT32_MIN for a 32-bit destination
+            c.gSet(osz, (osz == 4) ? 0x80000000ull : 0x8000000000000000ull);
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            return fault_code(Fault::None);
+        }
+        const int64_t iv = (op2 == 0x2C) ? static_cast<int64_t>(v) : static_cast<int64_t>(llrint(v)); // truncate toward zero
+        c.gSet(osz, static_cast<uint64_t>(iv) & maskSz(osz));
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        return fault_code(Fault::None);
+    }
+
+    // xmm dst/src(128) generic read: reg or full 16 bytes of memory
+    static bool sseSrc128(Ctx& c, uint64_t src[2]) {
+        if (c.oIsReg()) {
+            const int s = (c.mr.rm | (c.rexB << 3)) & 15;
+            src[0] = c.e.xmm[s][0];
+            src[1] = c.e.xmm[s][1];
+            return true;
+        }
+        const uint64_t ea = c.eaCalc();
+        return memLd<uint64_t>(c.e, ea, src[0]) && memLd<uint64_t>(c.e, ea + 8, src[1]);
+    }
+
+    // unpcklps/hps (none) and unpcklpd/hpd (66)
+    static uint32_t sseUnpck(Ctx& c, uint8_t op2) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.gRegIdx() & 15;
+        uint64_t s[2];
+        if (!sseSrc128(c, s)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        const uint64_t d0 = c.e.xmm[dst][0], d1 = c.e.xmm[dst][1];
+        if (c.op66) {
+            c.e.xmm[dst][0] = (op2 == 0x14) ? d0 : d1;
+            c.e.xmm[dst][1] = (op2 == 0x14) ? s[0] : s[1];
+        } else {
+            if (op2 == 0x14) c.e.xmm[dst][0] = (d0 & 0xFFFFFFFFull) | ((s[0] & 0xFFFFFFFFull) << 32);
+            else c.e.xmm[dst][0] = (d0 & 0xFFFFFFFF00000000ull) | (s[0] & 0xFFFFFFFFull);
+            if (op2 == 0x14) c.e.xmm[dst][1] = (d0 & 0xFFFFFFFF00000000ull) | (s[0] & 0xFFFFFFFF00000000ull);
+            else c.e.xmm[dst][1] = (d1 & 0xFFFFFFFF00000000ull) | (s[1] & 0xFFFFFFFF00000000ull);
+        }
+        return fault_code(Fault::None);
+    }
+
+    // cmpps/cmpss/cmppd/cmpsd with imm8 predicate 0..7 (dst vs src)
+    static uint32_t sseCmp(Ctx& c) {
+        const int kind = c.repF2 ? 3 : c.rep ? 1 : c.op66 ? 2 : 0;
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.gRegIdx() & 15;
+        uint64_t src[2];
+        if (!sseSrc(c, src, kind)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        const int pred = c.f.u8() & 7;
+        const int ln = (kind == 0 || kind == 2) ? 2 : 1;
+        uint64_t res[2] = { c.e.xmm[dst][0], c.e.xmm[dst][1] };
+        for (int i = 0; i < ln; ++i) {
+            bool ok;
+            if (kind < 2) {
+                const float a = ffrom(static_cast<uint32_t>(res[i] >> (32 * i)));
+                const float b = ffrom(static_cast<uint32_t>(src[0] >> (32 * i)));
+                ok = (pred == 0) ? a == b : (pred == 1) ? a < b : (pred == 2) ? a <= b
+                     : (pred == 3) ? (isnan(a) || isnan(b)) : (pred == 4) ? !(a == b)
+                     : (pred == 5) ? !(a < b) : (pred == 6) ? !(a <= b) : !(isnan(a) || isnan(b));
+            } else {
+                const double a = dfrom(res[i]);
+                const double b = dfrom(src[i]);
+                ok = (pred == 0) ? a == b : (pred == 1) ? a < b : (pred == 2) ? a <= b
+                     : (pred == 3) ? (isnan(a) || isnan(b)) : (pred == 4) ? !(a == b)
+                     : (pred == 5) ? !(a < b) : (pred == 6) ? !(a <= b) : !(isnan(a) || isnan(b));
+            }
+            const uint64_t w = (kind < 2) ? 0xFFFFFFFFull : ~0ull;
+            res[i] = ok ? (res[i] | w) : (res[i] & ~w);
+        }
+        c.e.xmm[dst][0] = res[0];
+        if (kind == 2) c.e.xmm[dst][1] = res[1];
+        return fault_code(Fault::None);
+    }
+
+    // shufps/shufpd with imm8
+    static uint32_t sseShuf(Ctx& c) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.gRegIdx() & 15;
+        uint64_t s[2];
+        if (!sseSrc128(c, s)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        const int imm = c.f.u8();
+        const uint64_t d0 = c.e.xmm[dst][0], d1 = c.e.xmm[dst][1];
+        if (c.op66) { // shufpd: 2 lanes
+            c.e.xmm[dst][0] = (imm & 1) ? d0 : s[0];
+            c.e.xmm[dst][1] = (imm & 2) ? d1 : s[1];
+            return fault_code(Fault::None);
+        }
+        const uint32_t dw[2][4] = {
+            { static_cast<uint32_t>(d0), static_cast<uint32_t>(d0 >> 32), static_cast<uint32_t>(d1), static_cast<uint32_t>(d1 >> 32) },
+            { static_cast<uint32_t>(s[0]), static_cast<uint32_t>(s[0] >> 32), static_cast<uint32_t>(s[1]), static_cast<uint32_t>(s[1] >> 32) },
+        };
+        const uint32_t r0 = dw[1][imm & 3], r1 = dw[1][(imm >> 2) & 3], r2 = dw[0][(imm >> 4) & 3], r3 = dw[0][imm >> 6];
+        c.e.xmm[dst][0] = static_cast<uint64_t>(r0) | (static_cast<uint64_t>(r1) << 32);
+        c.e.xmm[dst][1] = static_cast<uint64_t>(r2) | (static_cast<uint64_t>(r3) << 32);
+        return fault_code(Fault::None);
+    }
+
+    // pshufd (66), pshuflw (F3), pshufhw (F2), pshufw (NP, mmx) with imm8
+    static uint32_t ssePshuf(Ctx& c) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.gRegIdx() & 15;
+        uint64_t s[2];
+        if (c.oIsReg()) {
+            const int sr = (c.mr.rm | (c.rexB << 3)) & 15;
+            s[0] = c.e.xmm[sr][0];
+            s[1] = c.e.xmm[sr][1];
+        } else {
+            const uint64_t ea = c.eaCalc();
+            if (!memLd<uint64_t>(c.e, ea, s[0])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+            if (c.op66) {
+                if (!memLd<uint64_t>(c.e, ea + 8, s[1])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+            } else s[1] = 0;
+        }
+        const int imm = c.f.u8();
+        if (c.op66) { // pshufd over 4 dwords
+            const uint32_t w[4] = { static_cast<uint32_t>(s[0]), static_cast<uint32_t>(s[0] >> 32), static_cast<uint32_t>(s[1]), static_cast<uint32_t>(s[1] >> 32) };
+            c.e.xmm[dst][0] = static_cast<uint64_t>(w[imm & 3]) | (static_cast<uint64_t>(w[(imm >> 2) & 3]) << 32);
+            c.e.xmm[dst][1] = static_cast<uint64_t>(w[(imm >> 4) & 3]) | (static_cast<uint64_t>(w[(imm >> 6) & 3]) << 32);
+        } else if (c.repF2) { // pshufhw: high 4 words from s[1]
+            uint64_t v = 0;
+            for (int i = 0; i < 4; ++i)
+                v |= ((s[1] >> (16 * ((imm >> (2 * i)) & 3))) & 0xFFFFull) << (16 * i);
+            c.e.xmm[dst][1] = v;
+        } else { // pshuflw / pshufw: low 4 words from s[0]
+            uint64_t v = 0;
+            for (int i = 0; i < 4; ++i)
+                v |= ((s[0] >> (16 * ((imm >> (2 * i)) & 3))) & 0xFFFFull) << (16 * i);
+            c.e.xmm[dst][0] = v;
+            if (!c.rep) c.e.xmm[dst][1] = 0; // pshufw (mmx) clears the upper half
+        }
+        return fault_code(Fault::None);
+    }
+
+    // scalar lane shift used by the 71/72 word/dword groups
+    static uint64_t pshLane16(uint64_t w, uint64_t k, int sel) {
+        const uint16_t v = static_cast<uint16_t>(w & 0xFFFFull);
+        if (sel == 6) return k >= 16 ? 0 : static_cast<uint64_t>(static_cast<uint16_t>(v << k));
+        if (sel == 2) return k >= 16 ? 0 : static_cast<uint64_t>(v >> k);
+        const int16_t sv = static_cast<int16_t>(v);
+        const int32_t r = k >= 16 ? (sv < 0 ? -1 : 0) : (sv >> static_cast<int>(k));
+        return static_cast<uint64_t>(static_cast<uint16_t>(r));
+    }
+
+    // 66/NP 0F 71 (words), 72 (dwords), 73 (quad/byte whole-register) shifts
+    static uint32_t ssePShift(Ctx& c, uint8_t op2) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        // 0F 71/72/73: dst is the rm field; reg field is the shift subtype
+        const int dst = (c.mr.rm | (c.rexB << 3)) & 15;
+        const int sel = c.mr.reg & 7;
+        const uint64_t count = static_cast<uint8_t>(c.f.u8());
+        uint64_t v[2] = { c.e.xmm[dst][0], c.e.xmm[dst][1] };
+        if (op2 == 0x71) {
+            if (sel != 2 && sel != 4 && sel != 6) return fault_code(Fault::UnsupportedInstruction);
+            for (int i = 0; i < 8; ++i) {
+                const uint64_t w = pshLane16(i < 4 ? v[0] >> (16 * i) : v[1] >> (16 * (i - 4)), count, sel);
+                if (i < 4) v[0] = (v[0] & ~(0xFFFFull << (16 * i))) | (w << (16 * i));
+                else v[1] = (v[1] & ~(0xFFFFull << (16 * (i - 4)))) | (w << (16 * (i - 4)));
+            }
+        } else if (op2 == 0x72) {
+            if (sel != 2 && sel != 4 && sel != 6) return fault_code(Fault::UnsupportedInstruction);
+            const uint64_t k = count > 31 ? 32 : count;
+            for (int i = 0; i < 4; ++i) {
+                const uint64_t dw = (i < 2 ? v[0] >> (32 * i) : v[1] >> (32 * (i - 2)));
+                uint64_t r = 0;
+                if (sel == 6) r = k >= 32 ? 0 : (dw << k) & 0xFFFFFFFFull;
+                else if (sel == 2) r = k >= 32 ? 0 : dw >> k;
+                else {
+                    const int64_t sv = static_cast<int64_t>(static_cast<int32_t>(dw & 0xFFFFFFFFull));
+                    const int64_t ar = k >= 32 ? (sv < 0 ? -1 : 0) : sv >> static_cast<int>(k);
+                    r = static_cast<uint64_t>(ar) & 0xFFFFFFFFull;
+                }
+                if (i < 2) v[0] = (v[0] & ~(0xFFFFFFFFull << (32 * i))) | (r << (32 * i));
+                else v[1] = (v[1] & ~(0xFFFFFFFFull << (32 * (i - 2)))) | (r << (32 * (i - 2)));
+            }
+        } else { // 0x73
+            if (sel == 6) { // psllq: both qword lanes shift left independently
+                const uint64_t k = count > 63 ? 64 : count;
+                if (k >= 64) v[0] = v[1] = 0;
+                else { v[0] = v[0] << k; v[1] = c.op66 ? (v[1] << k) : 0; }
+            } else if (sel == 2) { // psrlq: both qword lanes shift right independently
+                const uint64_t k = count > 63 ? 64 : count;
+                if (k >= 64) v[0] = v[1] = 0;
+                else { v[0] = v[0] >> k; v[1] = c.op66 ? (v[1] >> k) : 0; }
+            } else if (sel == 7 && c.op66) { // pslldq: byte shift left over 128 bits (66 only)
+                const uint64_t k = count > 15 ? 16 : count;
+                const uint64_t L = v[0], H = v[1];
+                v[0] = k < 8 ? (L << (8 * k)) : 0;
+                v[1] = k == 0 ? H : k < 8 ? ((H << (8 * k)) | (L >> (64 - 8 * k))) : k == 8 ? L : 0;
+            } else if (sel == 3 && c.op66) { // psrldq
+                const uint64_t k = count > 15 ? 16 : count;
+                const uint64_t L = v[0], H = v[1];
+                v[0] = k == 0 ? L : k < 8 ? ((L >> (8 * k)) | (H << (64 - 8 * k))) : k == 8 ? H : (H >> (8 * (k - 8)));
+                v[1] = k < 8 ? (H >> (8 * k)) : 0;
+            } else return fault_code(Fault::UnsupportedInstruction);
+        }
+        if (!c.op66) v[1] = 0; // mmx forms live in the low 64 bits only
+        c.e.xmm[dst][0] = v[0];
+        c.e.xmm[dst][1] = v[1];
+        return fault_code(Fault::None);
+    }
+
+    // movd/movq GPR<->xmm/mmx: 0F 6E (mmx/66+REX load), 0F 7E (r/m store;
+    // F3 0F 7E is the SSE2 movq load), 66 0F D6 (movq store + reg,reg move
+    // that clears the upper half)
+    static uint32_t sseMoveDQ(Ctx& c, uint8_t op2) {
+        if (op2 == 0xD6 && !c.op66) return fault_code(Fault::UnsupportedInstruction);
+        if (op2 == 0x7E && c.repF2) return fault_code(Fault::UnsupportedInstruction);
+        const bool toXmm = (op2 == 0x6E) || (op2 == 0x7E && c.rep);
+        const bool isQ = (op2 == 0xD6) || (op2 == 0x7E && c.rep);
+        const bool use64 = ((c.rexW && is64 && c.op66) || isQ);
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        if (toXmm) {
+            const int dst = c.gRegIdx() & 15;
+            const uint64_t v = c.oVal(use64 ? 8 : 4);
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            c.e.xmm[dst][0] = v;
+            if (use64) c.e.xmm[dst][1] = 0;
+            return fault_code(Fault::None);
+        }
+        // source is the xmm/mmx reg; destination r/m (GPR/mem)
+        const int src = (c.mr.reg | (c.rexR << 3)) & 15;
+        if (c.oIsReg()) {
+            c.castSet((c.mr.rm | (c.rexB << 3)) & 15, use64 ? 8 : 4, c.e.xmm[src][0]);
+        } else {
+            const uint64_t ea = c.eaCalc();
+            if (use64) { if (!memSt<uint64_t>(c.e, ea, c.e.xmm[src][0])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; } }
+            else if (!memSt(c.e, ea, static_cast<uint32_t>(c.e.xmm[src][0]))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        }
+        return fault_code(Fault::None);
+    }
+
+    // mmx padd/psub families (NP = 8-byte mmx, 66 for paddq only) on the
+    // 64-bit low lane of the xmm register file
+    static uint32_t ssePaddSub(Ctx& c, uint8_t op2) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int dst = c.mr.reg & 7;
+        const int srcI = c.mr.rm & 7;
+        uint64_t s = 0;
+        if (c.oIsReg()) s = c.e.xmm[srcI][0];
+        else {
+            const uint64_t ea = c.eaCalc();
+            if (!memLd<uint64_t>(c.e, ea, s)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+        }
+        const uint64_t d = c.e.xmm[dst][0];
+        uint64_t r = 0;
+        if (op2 == 0xFC || op2 == 0xFE || op2 == 0xFD || op2 == 0xD4) { // add b/w/d/q
+            const int es = (op2 == 0xFC) ? 1 : (op2 == 0xFE) ? 4 : (op2 == 0xFD) ? 2 : 8;
+            for (int i = 0; i < 64 / (8 * es); ++i) {
+                const uint64_t e = 8 * es;
+                const uint64_t mask = (1ull << e) - 1;
+                if (es == 8) r = d + s; // full 64
+                else {
+                    const uint64_t a = (d >> (e * i)) & mask, b = (s >> (e * i)) & mask;
+                    r |= ((a + b) & mask) << (e * i);
+                }
+            }
+        } else { // psub b/w/d/q: FB/F8/F9/FA
+            const int es = (op2 == 0xF8) ? 1 : (op2 == 0xFB) ? 4 : (op2 == 0xF9) ? 2 : 8;
+            for (int i = 0; i < 64 / (8 * es); ++i) {
+                const uint64_t e = 8 * es;
+                const uint64_t mask = (1ull << e) - 1;
+                if (es == 8) r = d - s;
+                else {
+                    const uint64_t a = (d >> (e * i)) & mask, b = (s >> (e * i)) & mask;
+                    r |= ((a - b) & mask) << (e * i);
+                }
+            }
+        }
+        c.e.xmm[dst][0] = r;
+        return fault_code(Fault::None);
+    }
+
+    // pinsrw (0F C4)/pextrw (0F C5): word insert/extract with imm8 index
+    static uint32_t ssePinEx(Ctx& c, uint8_t op2) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const int idx = c.f.u8() & 7;
+        if (op2 == 0xC4) { // pinsrw xmm/ mm, r32/m16
+            const int dst = c.gRegIdx() & 15;
+            const uint64_t v = c.oVal(2);
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            uint64_t lo = c.e.xmm[dst][0];
+            lo = (lo & ~(0xFFFFull << (16 * idx))) | ((v & 0xFFFFull) << (16 * idx));
+            c.e.xmm[dst][0] = lo;
+            return fault_code(Fault::None);
+        }
+        // pextrw r32, xmm/mm
+        const int dst = c.gRegIdx() & 15;
+        uint64_t v = 0;
+        if (c.oIsReg()) {
+            const int s = (c.mr.rm | (c.rexB << 3)) & 15;
+            v = (c.e.xmm[s][0] >> (16 * idx)) & 0xFFFFull;
+        } else {
+            const uint64_t ea = c.eaCalc();
+            if (!memLd<uint64_t>(c.e, ea, v)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+            v = (v >> (16 * idx)) & 0xFFFFull;
+        }
+        c.castSet(dst, 4, v);
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        return fault_code(Fault::None);
+    }
+
+    // 0F 3A: pextrb 14 / pextrd 16 / pinsrb 20 / pinsrd 22 (66 required)
+    static uint32_t ssePinEx3A(Ctx& c) {
+        if (!c.op66) return fault_code(Fault::UnsupportedInstruction);
+        const uint8_t op3 = c.f.u8();
+        if (op3 != 0x14 && op3 != 0x16 && op3 != 0x20 && op3 != 0x22) return fault_code(Fault::UnsupportedInstruction);
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        const bool is64d = (op3 == 0x16 || op3 == 0x22) && c.rexW && is64;
+        if (op3 == 0x14 || op3 == 0x16) { // extract: r/m <- xmm lane imm8
+            const int srcreg = (c.mr.reg | (c.rexR << 3)) & 15;
+            const int idx = c.f.u8();
+            const int laneE = (op3 == 0x14) ? 8 : 4;
+            if (idx >= (laneE == 4 ? 4 : 16)) return fault_code(Fault::UnsupportedInstruction);
+            uint64_t xmm[2] = { c.e.xmm[srcreg][0], c.e.xmm[srcreg][1] };
+            const uint64_t bits = (laneE == 4)
+                ? ((idx & 1) ? (xmm[idx >> 1] >> 32) : xmm[idx >> 1]) & 0xFFFFFFFFull
+                : (static_cast<uint64_t>(idx) < 8 ? (xmm[0] >> (8 * idx)) : (xmm[1] >> (8 * (idx - 8)))) & 0xFFull;
+            if (c.oIsReg()) c.castSet((c.mr.rm | (c.rexB << 3)) & 15, laneE == 4 ? (is64d ? 8 : 4) : 1, bits);
+            else {
+                const uint64_t ea = c.eaCalc();
+                if (laneE == 4) {
+                    if (!memSt<uint64_t>(c.e, ea, bits & maskSz(is64d ? 8 : 4))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                } else if (!memSt(c.e, ea, static_cast<uint8_t>(bits))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+            }
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            return fault_code(Fault::None);
+        }
+        // insert: xmm lane <- r8/m8 or r32/m32 (sign/zero rules: pinsrd zero-extends, pinsrb)
+        const int dst = (c.mr.reg | (c.rexR << 3)) & 15;
+        const int idx = c.f.u8();
+        const bool dword = (op3 == 0x22);
+        const int laneE = dword ? 4 : 1;
+        const int laneN = dword ? 4 : 16;
+        if (idx >= laneN) return fault_code(Fault::UnsupportedInstruction);
+        const uint64_t v = c.oVal(laneE);
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        uint64_t word = 0;
+        if (dword) {
+            const int q = (idx >> 1) & 1;
+            word = static_cast<uint64_t>(static_cast<uint32_t>(v)) << (32 * (idx & 1));
+            if (q) c.e.xmm[dst][1] = (c.e.xmm[dst][1] & 0xFFFFFFFFull) | word;
+            else c.e.xmm[dst][0] = (c.e.xmm[dst][0] & 0xFFFFFFFF00000000ull) | word;
+        } else {
+            const int lane = (idx >> 3) & 1;
+            c.e.xmm[dst][lane] = (c.e.xmm[dst][lane] & ~(0xFFull << (8 * (idx & 7)))) | ((v & 0xFFull) << (8 * (idx & 7)));
+        }
+        return fault_code(Fault::None);
     }
 
     // ---- guest memory ----
@@ -1361,83 +1899,140 @@ private:
                 if (c.fault != fault_code(Fault::None)) return c.fault;
                 return fault_code(Fault::None);
             }
-            case 0x10: case 0x28: case 0x6F: { // movups/movaps/movdqa xmm, xmm/mem
-                if constexpr (is64) {
-                    c.decodeRm();
-                    if (c.fault != fault_code(Fault::None)) return c.fault;
+            case 0x10: case 0x11: case 0x28: case 0x29: case 0x6F: case 0x7F: {
+                // packed (movups/movaps/movdqa/movdqu) and scalar (F3 movss /
+                // F2 movsd) data movement; NP 6F/7F is the MMX movq form
+                const bool store = (op2 == 0x11 || op2 == 0x29 || op2 == 0x7F);
+                const bool scalar = (op2 == 0x10 || op2 == 0x11) && (c.rep || c.repF2);
+                const bool mmxQ = !c.rep && !c.repF2 && !c.op66 && (op2 == 0x6F || op2 == 0x7F);
+                const bool sss = scalar && c.rep && !c.repF2; // true movss; F2 (movsd) carries repF2
+                const int width = sss ? 4 : scalar ? 8 : mmxQ ? 8 : 16;
+                if (!scalar && op2 == 0x28 && (c.rep || c.repF2 || c.op66)) return fault_code(Fault::UnsupportedInstruction); // movaps is NP-only here (66/F3/F2 28 is not legacy SSE2)
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                if (!store) {
                     const int dst = c.gRegIdx() & 15;
+                    uint64_t v[2] = { 0, 0 };
                     if (c.oIsReg()) {
-                        const int src = c.mr.rm | (c.rexB << 3);
-                        c.e.xmm[dst][0] = c.e.xmm[src & 15][0];
-                        c.e.xmm[dst][1] = c.e.xmm[src & 15][1];
+                        const int s = (c.mr.rm | (c.rexB << 3)) & 15;
+                        v[0] = c.e.xmm[s][0];
+                        v[1] = c.e.xmm[s][1];
                     } else {
                         const uint64_t ea = c.eaCalc();
-                        uint64_t lo = 0, hi = 0;
-                        if (!memLd<uint64_t>(c.e, ea, lo) || !memLd<uint64_t>(c.e, ea + 8, hi)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
-                        c.e.xmm[dst][0] = lo;
-                        c.e.xmm[dst][1] = hi;
+                        if (width == 16) {
+                            if (!memLd<uint64_t>(c.e, ea, v[0]) || !memLd<uint64_t>(c.e, ea + 8, v[1])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                        } else if (!memLd<uint64_t>(c.e, ea, v[0])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                    }
+                    if (width == 16) {
+                        c.e.xmm[dst][0] = v[0];
+                        c.e.xmm[dst][1] = v[1];
+                    } else if (scalar && !c.repF2) { // movss: only the low doubleword moves
+                        c.e.xmm[dst][0] = (c.e.xmm[dst][0] & ~0xFFFFFFFFull) | (v[0] & 0xFFFFFFFFull);
+                    } else if (scalar) { // movsd: the low quadword moves, upper stays
+                        c.e.xmm[dst][0] = v[0];
+                    } else { // movq forms: low quadword in, upper cleared
+                        c.e.xmm[dst][0] = v[0];
+                        c.e.xmm[dst][1] = 0;
                     }
                     return fault_code(Fault::None);
                 }
-                return fault_code(Fault::UnsupportedInstruction);
+                // store
+                const int src = c.gRegIdx() & 15;
+                if (c.oIsReg()) { // reg,reg: copies the same overlap as the load form
+                    const int dstr = (c.mr.rm | (c.rexB << 3)) & 15;
+                    if (width == 16) {
+                        c.e.xmm[dstr][0] = c.e.xmm[src][0];
+                        c.e.xmm[dstr][1] = c.e.xmm[src][1];
+                    } else if (scalar && !c.repF2) { // movss reg,reg: low doubleword only
+                        c.e.xmm[dstr][0] = (c.e.xmm[dstr][0] & ~0xFFFFFFFFull) | (c.e.xmm[src][0] & 0xFFFFFFFFull);
+                    } else if (scalar) { // movsd reg,reg: low quadword only
+                        c.e.xmm[dstr][0] = c.e.xmm[src][0];
+                    } else { // movq reg,reg: low qword copied, upper cleared
+                        c.e.xmm[dstr][0] = c.e.xmm[src][0];
+                        c.e.xmm[dstr][1] = 0;
+                    }
+                    return fault_code(Fault::None);
+                }
+                const uint64_t ea = c.eaCalc();
+                if (width == 16) {
+                    if (!memSt<uint64_t>(c.e, ea, c.e.xmm[src][0]) || !memSt<uint64_t>(c.e, ea + 8, c.e.xmm[src][1])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                } else if (width == 8) {
+                    if (!memSt<uint64_t>(c.e, ea, c.e.xmm[src][0])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                } else {
+                    if (!memSt(c.e, ea, static_cast<uint32_t>(c.e.xmm[src][0]))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                }
+                return fault_code(Fault::None);
             }
-            case 0x11: case 0x29: case 0x7F: { // movups/movaps/movdqa mem, xmm
-                if constexpr (is64) {
-                    c.decodeRm();
-                    if (c.fault != fault_code(Fault::None)) return c.fault;
-                    if (c.oIsReg()) return fault_code(Fault::UnsupportedInstruction);
+            case 0x12: case 0x13: case 0x16: case 0x17: { // movlps/movlpd/movhps/movhpd
+                // reg-reg 12/16 = movhlps/movlhps; mem 13/17 = stores of low/high
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                if (c.oIsReg()) {
+                    if (op2 == 0x13 || op2 == 0x17) return fault_code(Fault::UnsupportedInstruction);
+                    const int dst = c.gRegIdx() & 15;
+                    const int s = (c.mr.rm | (c.rexB << 3)) & 15;
+                    if (op2 == 0x12) c.e.xmm[dst][0] = c.e.xmm[s][1]; // movhlps
+                    else c.e.xmm[dst][1] = c.e.xmm[s][0];             // movlhps
+                    return fault_code(Fault::None);
+                }
+                if (op2 == 0x13 || op2 == 0x17) { // store: dst is the xmm source
                     const int src = c.gRegIdx() & 15;
                     const uint64_t ea = c.eaCalc();
-                    if (!memSt<uint64_t>(c.e, ea, c.e.xmm[src][0]) || !memSt<uint64_t>(c.e, ea + 8, c.e.xmm[src][1])) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                    const uint64_t v = (op2 == 0x13) ? c.e.xmm[src][0] : c.e.xmm[src][1];
+                    if (!memSt<uint64_t>(c.e, ea, v)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
                     return fault_code(Fault::None);
                 }
-                return fault_code(Fault::UnsupportedInstruction);
+                const int dst = c.gRegIdx() & 15;
+                const uint64_t ea = c.eaCalc();
+                uint64_t v = 0;
+                if (!memLd<uint64_t>(c.e, ea, v)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                if (op2 == 0x12) c.e.xmm[dst][0] = v; else c.e.xmm[dst][1] = v;
+                return fault_code(Fault::None);
             }
-            case 0x12: case 0x13: { // 66 movlpd xmm, m64 / movlpd m64, xmm (x86)
-                if constexpr (!is64) {
-                    if (!c.op66) return fault_code(Fault::UnsupportedInstruction);
-                    c.decodeRm();
-                    if (c.fault != fault_code(Fault::None)) return c.fault;
-                    if (c.oIsReg()) return fault_code(Fault::UnsupportedInstruction);
-                    const int reg = c.mr.reg;
-                    const uint64_t ea = c.eaCalc();
-                    if (op2 == 0x13) {
-                        if (!memSt(c.e, ea, c.e.xmm[reg][0])) c.fault = fault_code(Fault::OutsideMemory);
-                    } else {
-                        if (!memLd(c.e, ea, c.e.xmm[reg][0])) c.fault = fault_code(Fault::OutsideMemory);
-                        c.e.xmm[reg][1] = 0;
-                    }
-                    if (c.fault != fault_code(Fault::None)) return c.fault;
-                    return fault_code(Fault::None);
-                }
-                return fault_code(Fault::UnsupportedInstruction);
+            case 0x5A: case 0x5B: case 0xE6:
+                return sseCvtFlt(c, op2);
+            case 0x2A: case 0x2C: case 0x2D:
+                return sseCvtInt(c, op2);
+            case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58:
+            case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+                return sseBin(c, op2);
+            case 0x14: case 0x15:
+                return sseUnpck(c, op2);
+            case 0xC2:
+                return sseCmp(c);
+            case 0xC6:
+                return sseShuf(c);
+            case 0x70:
+                return ssePshuf(c);
+            case 0x71: case 0x72: case 0x73:
+                return ssePShift(c, op2);
+            case 0x6E: case 0x7E: case 0xD6:
+                return sseMoveDQ(c, op2);
+            case 0xC4: case 0xC5:
+                return ssePinEx(c, op2);
+            case 0xFC: case 0xFD: case 0xFE: case 0xD4:
+            case 0xF8: case 0xF9: case 0xFA: case 0xFB:
+                return ssePaddSub(c, op2);
+            case 0x3A: // three-byte escape 0F 3A: pinsrb/pextrb/pinsrd/pextrd forms only
+                return ssePinEx3A(c);
+            case 0x77: { // emms: no state to reset in this design
+                return fault_code(Fault::None);
             }
-            case 0x57: case 0xEF: { // xorps/pxor: x64 reg+mem, x86 reg-reg zero idiom
-                if constexpr (is64) {
-                    c.decodeRm();
-                    if (c.fault != fault_code(Fault::None)) return c.fault;
-                    const int dst = c.gRegIdx() & 15;
-                    if (c.oIsReg()) {
-                        const int src = c.mr.rm | (c.rexB << 3);
-                        c.e.xmm[dst][0] ^= c.e.xmm[src & 15][0];
-                        c.e.xmm[dst][1] ^= c.e.xmm[src & 15][1];
-                    } else {
-                        const uint64_t ea = c.eaCalc();
-                        uint64_t lo = 0, hi = 0;
-                        if (!memLd<uint64_t>(c.e, ea, lo) || !memLd<uint64_t>(c.e, ea + 8, hi)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
-                        c.e.xmm[dst][0] ^= lo;
-                        c.e.xmm[dst][1] ^= hi;
-                    }
-                    return fault_code(Fault::None);
+            case 0xEF: { // pxor: full-width xor, both archs
+                c.decodeRm();
+                if (c.fault != fault_code(Fault::None)) return c.fault;
+                const int dst = c.gRegIdx() & 15;
+                if (c.oIsReg()) {
+                    const int s = (c.mr.rm | (c.rexB << 3)) & 15;
+                    c.e.xmm[dst][0] ^= c.e.xmm[s][0];
+                    c.e.xmm[dst][1] ^= c.e.xmm[s][1];
                 } else {
-                    c.decodeRm();
-                    if (c.fault != fault_code(Fault::None)) return c.fault;
-                    if (!c.oIsReg()) return fault_code(Fault::UnsupportedInstruction);
-                    const int dst = c.mr.reg, src = c.mr.rm;
-                    c.e.xmm[dst][0] = c.e.xmm[dst][1] = c.e.xmm[dst][0] ^ c.e.xmm[src][0];
-                    c.e.xmm[dst][1] ^= c.e.xmm[src][1];
-                    return fault_code(Fault::None);
+                    uint64_t src[2];
+                    if (!sseSrc(c, src, 2)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                    c.e.xmm[dst][0] ^= src[0];
+                    c.e.xmm[dst][1] ^= src[1];
                 }
+                return fault_code(Fault::None);
             }
             case 0x0B: return fault_code(Fault::UnsupportedInstruction);
             case 0xA2: { // CPUID: Intel vendor; leaves past 1 report no features so
