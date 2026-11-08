@@ -17,8 +17,10 @@ FAULT_LO = 0xE0000001
 FAULT_HI = 0xE0000009
 TMP = pathlib.Path(r"C:\Users\avart\AppData\Local\Temp\opencode\fuzz")
 # mutated code can wander through long paths; the budget keeps Debug builds
-# (slow per instruction) inside the timeout instead of tripping it
-ENV = dict(os.environ, SHELLTERP_BUDGET="50000000")
+# (slow per instruction) inside the timeout instead of tripping it.
+# Debug x87 heavy loops burn the 30s timeout at 5e7, so Debug uses 5e6.
+ENV = dict(os.environ, SHELLTERP_BUDGET=("5000000" if conftest.CONFIG == "Debug"
+                                         else "50000000"))
 
 
 def _clean_exit(returncode: int) -> bool:

@@ -70,6 +70,12 @@ private:
         // minimal 128-bit register file for SSE data movement
         // (movaps/movups/... on x64, movlpd/xorps on x86)
         uint64_t xmm[kXmmCount][2] = {};
+        // minimal x87 stack: 8 doubles, TOP index and the compare condition
+        // bits of a half status word (C0 bit 8, C1 bit 9, C2 bit 10, C3 bit 14)
+        double x87St[8] = {};
+        int fTop = 0;
+        uint16_t fsw = 0;
+        uint16_t fCw = 0x027F; // control word default; rounding treated as always-RNE
         uint64_t ip = 0;
         bool cf = false, of = false, sf = false, zf = false, pf = false, af = false, df = false;
         Loaded* l = nullptr;
@@ -876,6 +882,295 @@ private:
         return fault_code(Fault::None);
     }
 
+    // ---- x87 (batch C) ----
+    // 8 stacked doubles with TOP in e.fTop; ST(i) = x87St[(fTop + i) & 7].
+    // Compares keep C0/C1/C2/C3 in fsw at their real status-word positions
+    // (8/9/10/14); fnstsw/fstsw emit fsw with TOP in bits 11-13.
+    static double fpuSt(Emu& e, int i) { return e.x87St[(e.fTop + (i & 7)) & 7]; }
+    static void fpuStSet(Emu& e, int i, double v) { e.x87St[(e.fTop + (i & 7)) & 7] = v; }
+    static void fpuPush(Emu& e, double v) { e.fTop = (e.fTop - 1) & 7; e.x87St[e.fTop] = v; }
+    static void fpuPop(Emu& e) { e.fTop = (e.fTop + 1) & 7; }
+    static void fpuCom(Emu& e, double a, double b, bool setFlags) {
+        e.fsw &= ~0x4700u; // C0..C3
+        if (a != a || b != b) e.fsw |= 0x4700u; // unordered
+        else if (a < b) e.fsw |= 0x0100u;
+        else if (a == b) e.fsw |= 0x4000u;
+        if (setFlags) { e.zf = ((e.fsw >> 14) & 1) != 0; e.pf = ((e.fsw >> 10) & 1) != 0; e.cf = ((e.fsw >> 8) & 1) != 0; }
+    }
+    // FIST-style store: default control word rounds to nearest even;
+    // out-of-range/NaN writes the integer indefinite value (INT_MIN).
+    static int64_t fpuToInt(double v, int64_t indef) {
+        if (v != v || v < (indef == 0x8000000000000000ll ? -9223372036854775808.0 : -2147483648.0)) return indef; // NaN + beyond range: indefinite
+        const double r = std::llrint(v);
+        if (r != r || r >= (indef == 0x8000000000000000ll ? 9223372036854775808.0 : 2147483648.0)) return indef;
+        return static_cast<int64_t>(r);
+    }
+    static uint32_t fpuOom(Ctx& c) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+
+    static uint32_t x87Op(Ctx& c, uint8_t op) {
+        c.decodeRm();
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        Emu& e = c.e;
+        const int r = c.mr.reg & 7;
+        if (!c.oIsReg()) { // memory forms
+            const uint64_t ea = c.eaCalc();
+            switch (op) {
+            case 0xD8: { // m32 float arithmetic
+                uint32_t b;
+                if (!memLd(c.e, ea, b)) return fpuOom(c);
+                const double v = ffrom(b);
+                switch (r) {
+                case 0: fpuStSet(e, 0, fpuSt(e, 0) + v); break; // fadd
+                case 1: fpuStSet(e, 0, fpuSt(e, 0) * v); break; // fmul
+                case 2: fpuCom(e, fpuSt(e, 0), v, false); break; // fcom
+                case 3: fpuCom(e, fpuSt(e, 0), v, false); fpuPop(e); break; // fcomp
+                case 4: fpuStSet(e, 0, fpuSt(e, 0) - v); break; // fsub
+                case 5: fpuStSet(e, 0, v - fpuSt(e, 0)); break; // fsubr
+                case 6: fpuStSet(e, 0, fpuSt(e, 0) / v); break; // fdiv
+                case 7: fpuStSet(e, 0, v / fpuSt(e, 0)); break; // fdivr
+                }
+                break;
+            }
+            case 0xD9: { // fld/fst/fstp m32; fldcw (load, control ignored); fnstcw m16
+                if (r == 0) {
+                    uint32_t b;
+                    if (!memLd(c.e, ea, b)) return fpuOom(c);
+                    fpuPush(e, ffrom(b));
+                } else if (r == 2 || r == 3) {
+                    if (!memSt(c.e, ea, static_cast<uint32_t>(fto(static_cast<float>(fpuSt(e, 0)))))) return fpuOom(c);
+                    if (r == 3) fpuPop(e);
+                } else if (r == 5) {
+                    uint16_t b;
+                    if (!memLd(c.e, ea, b)) return fpuOom(c);
+                    e.fCw = b; // rounding modes not modeled; stored and echoed
+                } else if (r == 7) {
+                    if (!memSt(c.e, ea, e.fCw)) return fpuOom(c);
+                } else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            }
+            case 0xDA: { // m32 int arithmetic: fiadd/fimul/ficom/ficomp/fisub/fisubr/fidiv/fidivr
+                uint32_t b;
+                if (!memLd(c.e, ea, b)) return fpuOom(c);
+                const double v = static_cast<double>(static_cast<int32_t>(b));
+                switch (r) {
+                case 0: fpuStSet(e, 0, fpuSt(e, 0) + v); break;
+                case 1: fpuStSet(e, 0, fpuSt(e, 0) * v); break;
+                case 2: fpuCom(e, fpuSt(e, 0), v, false); break;
+                case 3: fpuCom(e, fpuSt(e, 0), v, false); fpuPop(e); break;
+                case 4: fpuStSet(e, 0, fpuSt(e, 0) - v); break;
+                case 5: fpuStSet(e, 0, v - fpuSt(e, 0)); break;
+                case 6: fpuStSet(e, 0, fpuSt(e, 0) / v); break;
+                case 7: fpuStSet(e, 0, v / fpuSt(e, 0)); break;
+                }
+                break;
+            }
+            case 0xDB: { // fild m32 / fist m32 / fistp m32
+                if (r == 0) {
+                    uint32_t b;
+                    if (!memLd(c.e, ea, b)) return fpuOom(c);
+                    fpuPush(e, static_cast<double>(static_cast<int32_t>(b)));
+                } else if (r == 2 || r == 3) {
+                    if (!memSt(c.e, ea, static_cast<uint32_t>(static_cast<int32_t>(fpuToInt(fpuSt(e, 0), -2147483648ll))))) return fpuOom(c);
+                    if (r == 3) fpuPop(e);
+                } else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            }
+            case 0xDC: { // m64 double arithmetic
+                uint64_t b;
+                if (!memLd<uint64_t>(c.e, ea, b)) return fpuOom(c);
+                const double v = dfrom(b);
+                switch (r) {
+                case 0: fpuStSet(e, 0, fpuSt(e, 0) + v); break;
+                case 1: fpuStSet(e, 0, fpuSt(e, 0) * v); break;
+                case 2: fpuCom(e, fpuSt(e, 0), v, false); break;
+                case 3: fpuCom(e, fpuSt(e, 0), v, false); fpuPop(e); break;
+                case 4: fpuStSet(e, 0, fpuSt(e, 0) - v); break;
+                case 5: fpuStSet(e, 0, v - fpuSt(e, 0)); break;
+                case 6: fpuStSet(e, 0, fpuSt(e, 0) / v); break;
+                case 7: fpuStSet(e, 0, v / fpuSt(e, 0)); break;
+                }
+                break;
+            }
+            case 0xDD: { // fld/fst/fstp m64; fnstsw m16
+                if (r == 0) {
+                    uint64_t b;
+                    if (!memLd<uint64_t>(c.e, ea, b)) return fpuOom(c);
+                    fpuPush(e, dfrom(b));
+                } else if (r == 2 || r == 3) {
+                    if (!memSt<uint64_t>(c.e, ea, dto(fpuSt(e, 0)))) return fpuOom(c);
+                    if (r == 3) fpuPop(e);
+                } else if (r == 7) {
+                    if (!memSt(c.e, ea, static_cast<uint16_t>(e.fsw | (e.fTop << 11)))) return fpuOom(c);
+                } else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            }
+            case 0xDE: { // m16 int arithmetic (same set as DA)
+                uint16_t b;
+                if (!memLd(c.e, ea, b)) return fpuOom(c);
+                const double v = static_cast<double>(static_cast<int16_t>(b));
+                switch (r) {
+                case 0: fpuStSet(e, 0, fpuSt(e, 0) + v); break;
+                case 1: fpuStSet(e, 0, fpuSt(e, 0) * v); break;
+                case 2: fpuCom(e, fpuSt(e, 0), v, false); break;
+                case 3: fpuCom(e, fpuSt(e, 0), v, false); fpuPop(e); break;
+                case 4: fpuStSet(e, 0, fpuSt(e, 0) - v); break;
+                case 5: fpuStSet(e, 0, v - fpuSt(e, 0)); break;
+                case 6: fpuStSet(e, 0, fpuSt(e, 0) / v); break;
+                case 7: fpuStSet(e, 0, v / fpuSt(e, 0)); break;
+                }
+                break;
+            }
+            case 0xDF: { // fild/fist/fistp m16; fild/fistp m64
+                if (r == 0) {
+                    uint16_t b;
+                    if (!memLd(c.e, ea, b)) return fpuOom(c);
+                    fpuPush(e, static_cast<double>(static_cast<int16_t>(b)));
+                } else if (r == 2 || r == 3 || r == 6) {
+                    if (!memSt(c.e, ea, static_cast<uint16_t>(static_cast<int16_t>(fpuToInt(fpuSt(e, 0), -32768))))) return fpuOom(c);
+                    if (r != 2) fpuPop(e);
+                } else if (r == 5 || r == 7) {
+                    uint64_t b;
+                    if (r == 5 && !memLd<uint64_t>(c.e, ea, b)) return fpuOom(c);
+                    if (r == 5) fpuPush(e, static_cast<double>(static_cast<int64_t>(b)));
+                    else if (!memSt<uint64_t>(c.e, ea, static_cast<uint64_t>(static_cast<int64_t>(fpuToInt(fpuSt(e, 0), (-9223372036854775807ll - 1)))))) return fpuOom(c);
+                    if (r == 7) fpuPop(e);
+                } else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            }
+            }
+            if (c.fault != fault_code(Fault::None)) return c.fault;
+            return fault_code(Fault::None);
+        }
+        // mod==3 register forms: dst ST(i), src/cmpdst ST(0) unless noted
+        const int i = c.mr.rm & 7;
+        switch (op) {
+        case 0xD8:
+            switch (r) {
+            case 0: fpuStSet(e, 0, fpuSt(e, 0) + fpuSt(e, i)); break; // fadd st0, st(i)
+            case 1: fpuStSet(e, 0, fpuSt(e, 0) * fpuSt(e, i)); break;
+            case 2: fpuCom(e, fpuSt(e, 0), fpuSt(e, i), false); break; // fcom st(i)
+            case 3: fpuCom(e, fpuSt(e, 0), fpuSt(e, i), false); fpuPop(e); break; // fcomp
+            case 4: fpuStSet(e, 0, fpuSt(e, 0) - fpuSt(e, i)); break;
+            case 5: fpuStSet(e, 0, fpuSt(e, i) - fpuSt(e, 0)); break; // fsubr
+            case 6: fpuStSet(e, 0, fpuSt(e, 0) / fpuSt(e, i)); break;
+            case 7: fpuStSet(e, 0, fpuSt(e, i) / fpuSt(e, 0)); break; // fdivr
+            }
+            break;
+        case 0xD9:
+            switch (r) {
+            case 0: fpuPush(e, fpuSt(e, i)); break; // fld st(i): push a copy
+            case 1: { const double t = fpuSt(e, 0); fpuStSet(e, 0, fpuSt(e, i)); fpuStSet(e, i, t); break; } // fxch
+            case 4: // E0 fchs / E1 fabs
+                if (i == 0) fpuStSet(e, 0, -fpuSt(e, 0));
+                else if (i == 1) fpuStSet(e, 0, std::fabs(fpuSt(e, 0)));
+                else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            case 5: { // E8-EF: push FP constants; EE fldz
+                static const double consts[6] = { 1.0, std::log2(10.0), std::log2(2.7182818284590452354), 3.14159265358979323846, std::log10(2.0), std::log(2.0) };
+                if (i < 6) fpuPush(e, consts[i]);
+                else if (i == 6) fpuPush(e, 0.0); // fldz
+                else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            }
+            case 6: // F0-F7: f2xm1/fyl2x/fptan/fpatan/fxtract/fprem1/fdecstp/fincstp
+                switch (i) {
+                case 0: fpuStSet(e, 0, std::pow(2.0, fpuSt(e, 0)) - 1.0); break;
+                case 1: { fpuStSet(e, 1, fpuSt(e, 1) * std::log2(std::fabs(fpuSt(e, 0)))); fpuPop(e); break; } // fyl2x
+                case 2: { const double t = std::tan(fpuSt(e, 0)); fpuStSet(e, 1, t); fpuPush(e, 1.0); break; } // fptan
+                case 3: { fpuStSet(e, 1, std::atan(fpuSt(e, 1) / fpuSt(e, 0))); fpuPop(e); break; } // fpatan
+                case 4: { const double v = fpuSt(e, 0); // fxtract: st0 = exponent part, push significand below
+                             if (v != v || v >= 1e308 * 4 || v <= -1e308 * 4) { fpuPush(e, v); break; }
+                             int exp10 = 0; const double m = std::frexp(v, &exp10); fpuPush(e, m); fpuStSet(e, 0, static_cast<double>(exp10 - 1)); break; }
+                case 5: { const double y = fpuSt(e, 1), x = fpuSt(e, 0); const double q = std::nearbyint(x / y); fpuStSet(e, 0, x - y * q); break; } // fprem1
+                case 6: e.fTop = (e.fTop - 1) & 7; break; // fdecstp
+                case 7: e.fTop = (e.fTop + 1) & 7; break; // fincstp
+                }
+                break;
+            case 7: // F8-FF: fprem/fyl2xp1/fsqrt/fsincos/frndint/fscale/fsin/fcos
+                switch (i) {
+                case 0: { const double y = fpuSt(e, 1), x = fpuSt(e, 0); const double q = std::trunc(x / y); // fprem: partial quotient in C0..C3
+                             e.fsw &= ~0x4700u;
+                             const int64_t qi = static_cast<int64_t>(q);
+                             e.fsw |= ((qi & 1) ? 0x100u : 0) | ((qi & 2) ? 0x200u : 0) | ((qi & 4) ? 0x4000u : 0);
+                             fpuStSet(e, 0, x - y * q); break; }
+                case 1: { fpuStSet(e, 1, fpuSt(e, 1) * std::log2(std::fabs(fpuSt(e, 0)) + 1.0)); fpuPop(e); break; } // fyl2xp1
+                case 2: fpuStSet(e, 0, std::sqrt(fpuSt(e, 0))); break; // fsqrt
+                case 3: { const double v = fpuSt(e, 0); fpuPush(e, std::cos(v)); fpuStSet(e, 1, std::sin(v)); break; } // fsincos: st0=cos, st1=sin
+                case 4: fpuStSet(e, 0, static_cast<double>(std::llrint(fpuSt(e, 0)))); break; // frndint (RNE)
+                case 5: fpuStSet(e, 0, fpuSt(e, 0) * std::pow(2.0, std::trunc(fpuSt(e, 1)))); break; // fscale
+                case 6: fpuStSet(e, 0, std::sin(fpuSt(e, 0))); break; // fsin
+                case 7: fpuStSet(e, 0, std::cos(fpuSt(e, 0))); break; // fcos
+                }
+                break;
+            }
+            break;
+        case 0xDA: // fcmov cc (reg 0-3 only): st0 = st(i) when condition holds
+            if (r == 0 ? e.cf : r == 1 ? e.zf : r == 2 ? (e.cf || e.zf) : e.pf)
+                fpuStSet(e, 0, fpuSt(e, i));
+            if (r > 3) return fault_code(Fault::UnsupportedInstruction);
+            break;
+        case 0xDB:
+            if (r == 4) { // E2 fnclex / E3 fninit
+                if (i == 2) { e.fsw = 0; }
+                else if (i == 3) { e.fsw = 0; e.fTop = 0; e.fCw = 0x037F; }
+                else return fault_code(Fault::UnsupportedInstruction);
+                break;
+            }
+            if (r == 3) { // fcmovnu st0, st(i)
+                if (!e.pf) fpuStSet(e, 0, fpuSt(e, i));
+                break;
+            }
+            if (r == 5 || r == 6) { // DB E8+i fucomi / DB F0+i fcomi: set EFLAGS
+                fpuCom(e, fpuSt(e, 0), fpuSt(e, i), true);
+                break;
+            }
+            return fault_code(Fault::UnsupportedInstruction);
+        case 0xDC:
+            switch (r) {
+            case 0: fpuStSet(e, i, fpuSt(e, i) + fpuSt(e, 0)); break;
+            case 1: fpuStSet(e, i, fpuSt(e, i) * fpuSt(e, 0)); break;
+            // DC/DE reg-table sub/div directions differ from D8/DA (verified
+            // on real hardware): /4 reverse, /5 plain, /6 reverse, /7 plain
+            case 4: fpuStSet(e, i, fpuSt(e, 0) - fpuSt(e, i)); break;
+            case 5: fpuStSet(e, i, fpuSt(e, i) - fpuSt(e, 0)); break;
+            case 6: fpuStSet(e, i, fpuSt(e, 0) / fpuSt(e, i)); break;
+            case 7: fpuStSet(e, i, fpuSt(e, i) / fpuSt(e, 0)); break;
+            default: return fault_code(Fault::UnsupportedInstruction);
+            }
+            break;
+        case 0xDD:
+            switch (r) {
+            case 0: break; // ffree st(i)
+            case 1: { const double t = fpuSt(e, 0); fpuStSet(e, 0, fpuSt(e, i)); fpuStSet(e, i, t); break; } // fxch (DD C8+i)
+            case 2: fpuStSet(e, i, fpuSt(e, 0)); break; // fst st(i)
+            case 3: fpuStSet(e, i, fpuSt(e, 0)); fpuPop(e); break; // fstp st(i)
+            case 4: fpuCom(e, fpuSt(e, 0), fpuSt(e, i), false); break; // fucom
+            case 5: fpuCom(e, fpuSt(e, 0), fpuSt(e, i), false); fpuPop(e); break; // fucomp
+            default: return fault_code(Fault::UnsupportedInstruction);
+            }
+            break;
+        case 0xDE: // like DC but pops (rotation form); DE D9 = fcompp
+            if (r == 3 && i == 1) { fpuCom(e, fpuSt(e, 0), fpuSt(e, 1), false); fpuPop(e); fpuPop(e); break; } // fcompp
+            switch (r) {
+            case 0: fpuStSet(e, i, fpuSt(e, i) + fpuSt(e, 0)); fpuPop(e); break; // faddp
+            case 1: fpuStSet(e, i, fpuSt(e, i) * fpuSt(e, 0)); fpuPop(e); break; // fmulp
+            case 2: fpuCom(e, fpuSt(e, 0), fpuSt(e, i), false); fpuPop(e); break; // fcomp st(i)
+            case 4: fpuStSet(e, i, fpuSt(e, 0) - fpuSt(e, i)); fpuPop(e); break; // fsubp st(i), st0
+            case 5: fpuStSet(e, i, fpuSt(e, i) - fpuSt(e, 0)); fpuPop(e); break; // fsubrp
+            case 6: fpuStSet(e, i, fpuSt(e, 0) / fpuSt(e, i)); fpuPop(e); break; // fdivp
+            case 7: fpuStSet(e, i, fpuSt(e, i) / fpuSt(e, 0)); fpuPop(e); break; // fdivrp
+            default: return fault_code(Fault::UnsupportedInstruction);
+            }
+            break;
+        case 0xDF: // DF E0 fnstsw ax; DF E8+i fucomip / DF F0+i fcomip: compare, set EFLAGS, pop
+            if (r == 4 && i == 0) { e.r[0] = (e.r[0] & ~0xFFFFull) | static_cast<uint64_t>((e.fsw | (e.fTop << 11)) & 0xFFFF); break; } // fnstsw ax (implicit AX = reg 0)
+            if (r == 5 || r == 6) { fpuCom(e, fpuSt(e, 0), fpuSt(e, i), true); fpuPop(e); break; }
+            return fault_code(Fault::UnsupportedInstruction);
+        }
+        if (c.fault != fault_code(Fault::None)) return c.fault;
+        return fault_code(Fault::None);
+    }
+
     // ---- guest memory ----
 
     static bool push64(Emu& e, uint64_t v) {
@@ -1170,7 +1465,9 @@ private:
         }
         case 0xD8: case 0xD9: case 0xDA: case 0xDB:
         case 0xDC: case 0xDD: case 0xDE: case 0xDF:
-            return fault_code(Fault::UnsupportedInstruction);
+            return x87Op(c, op);
+        case 0x9B: // fwait: no async FP state to synchronize
+            return fault_code(Fault::None);
         case 0x8D: {
             c.decodeRm();
             if (c.fault != fault_code(Fault::None)) return c.fault;
