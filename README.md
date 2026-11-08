@@ -40,6 +40,52 @@ them. A blob that registers nothing still runs: those services fail closed.
 
 See `PLAN.md` for the roadmap and the user decisions behind these choices.
 
+## Feature status
+
+Implemented (verified by the pytest corpus and value tests, Release + Debug,
+both archs):
+
+- **Core**: x64 and x86 user-mode integer instruction set to full opcode
+  coverage — rotates (rol/ror/rcl/rcr), 64-bit mul/imul, shld/shrd,
+  bsf/bsr, popcnt, crc32, xadd, lahf/sahf, fs/gs moves, scas and the other
+  string ops (movs/stos/...), cwd/cbw family, int3/pause/endbr/nop forms.
+- **SSE/SSE2**: packed and scalar float ALU, conversions (with integer
+  indefinite on out-of-range), compare predicates, shuffles, unpacks,
+  pshifts, movd/movq, pinsr*/pexr* family (per-lane semantics validated
+  against real hardware).
+- **x87**: D8–DF all memory and register forms — arith/compare, fcmovcc,
+  fxch, fsincos, fprem, fild/fistp all widths, fldcw/fnstcw/fnstsw/fninit,
+  DC/DE sub/div direction table measured on real hardware.
+- **Memory / environment**: fake PEB/TEB/LDR environment with self-pointer
+  TEB, opcode-driven memory access with an emulated image+stack layout,
+  guest-declared descriptor for image-relative services.
+- **OS-facing services**: WinAPI/CRT stand-in table (LoadLibraryA-style
+  imports, MessageBox, CRT printf/rand/srand, thread creation, resource
+  APIs, RaiseException) — compiled in, never real API calls.
+- **Exceptions**: guest C++ throw/catch and SEH with real unwind metadata
+  (x64 FH4 tables, x86 FS:[0] chain + scope tables), handlers run as
+  funclets; uncovered constructs fail closed.
+- **Threads**: emulated join-driven worker threads, single-threaded host.
+- **Fail-closed discipline**: unknown opcode, out-of-range access,
+  malformed metadata, missing state — all reserved faults, never a crash;
+  instruction budget (`SHELLTERP_BUDGET`) with `0xE0000009` on exhaustion;
+  executable-region audit before/after every run.
+
+Not yet implemented (planned, in order):
+
+- **Whole-memory guest access** — currently guest data access is limited
+  to the declared image/stack regions; extend access and pointer handling
+  so emulated code can read/write anywhere in the interpreter-owned
+  address space.
+- **Arbitrary function invocation via native stubs/gadgets** — guest
+  `call`/`jmp` into a prepared thunk/gadget region and return, with the
+  full register file (GPRs, xmm, flags) emulated correctly across the
+  transition, so shellcode can invoke any resident stand-in or prepared
+  code path, not just the fixed import endpoints.
+- **More user-mode instruction families** as real-world corpora demand
+  them (fuzzing continues to surface gaps; everything else already fails
+  closed).
+
 ## Exit and fault codes
 
 The process exit code is the outcome of the run: for a shellcode that
