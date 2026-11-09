@@ -3,6 +3,33 @@
 The compiler must not see namespaces and lazy shortcuts. The reviewer sees
 classes, RAII and honest names. Read this before you touch any source file.
 
+## Mandatory structure (non-negotiable, review gate)
+
+These rules are forced, not preferred. A change that violates them is
+rejected at review, even if it works.
+
+- **RAII, always.** Every resource (handle, allocation, mapping, file,
+  lock) lives in a class whose destructor releases it; ownership is
+  `std::unique_ptr` or a resource class, never a raw owning pointer; no
+  manual `delete`/`CloseHandle`/`VirtualFree` in main flow; a new resource
+  type gets its own RAII class. Rule of 3/5: deleting, copying or moving
+  one means define all of them.
+- **Small functions.** One job per function; one screen (~40 lines) is the
+  ceiling. The moment a function needs a second concept (its own loop,
+  its own guard pattern, its own local protocol), it becomes a second
+  function. Guard macros (`RETURN_ON_FAULT`) do not excuse size.
+- **Small modules.** One class per .hpp/.cpp pair, grouped only when
+  tightly coupled and each is small. A file grows past ~400 lines or
+  serves a second reason to exist: split it. Splitting is a
+  behavior-preserving refactor repeatedly run through the pytest gate,
+  never a rewrite.
+- **Split to classes.** A struct with the functions that always operate on
+  it is a class (private fields first, a small public surface). Found
+  helpers that only one class uses become its private static members.
+  Rounded helper collections in a big file (e.g. SSE/x87 tables inside a
+  CPU file) become their own file+class pair when the file hits the line
+  ceiling.
+
 ## Structure
 
 - Split the project into modules and files so each file has one reason to

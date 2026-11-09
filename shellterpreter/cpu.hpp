@@ -57,11 +57,13 @@ inline bool hostPageAddr(uint64_t addr, uint64_t size, bool forWrite, uint8_t*& 
     if (!VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<size_t>(addr)), &mbi, sizeof(mbi)))
         return false;
     if (mbi.State != MEM_COMMIT) return false;
-    const DWORD prot = mbi.Protect & ~PAGE_GUARD;
+    const DWORD prot = mbi.Protect;
+    // guard and no-access pages fail closed: touching the page would raise
+    // an uncaught STATUS_GUARD_PAGE_VIOLATION, not a fault (hardening batch)
+    if (prot & (PAGE_GUARD | PAGE_NOACCESS)) return false;
     const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
                            PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if (prot & PAGE_NOACCESS) return false;
     if (forWrite ? !(prot & writable) : !(prot & readable)) return false;
     const uint64_t base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
     const uint64_t len = static_cast<uint64_t>(mbi.RegionSize);

@@ -72,6 +72,26 @@ case("wholememory_virtualalloc",
             + "mov byte ptr [eax], 0x42\nmovzx eax, byte ptr [eax]\n"),
      0x42)
 
+# --- guard page fails closed: guest read must fault, not crash the process ---
+# PAGE_GUARD = 0x100 modifier; allocate RW | GUARD = 0x104. A bare 0x40 protect
+# is PAGE_EXECUTE_READWRITE, so the guest would mint real RWX pages and the
+# audit rejects that by design (0xE0000005) - wrong would-be test, see ledger
+a64, a86 = _load_gpa("kernel32.dll", "VirtualAlloc", SCR, SCR + 0x20)
+case("wholememory_guardpage_faults",
+     a64 + ("xor ecx, ecx\nmov rdx, 0x1000\nmov r8d, 0x1000\nmov r9d, 0x104\ncall rax\n"
+            "movzx eax, byte ptr [rax]\n"),
+     a86 + (guestkit.x86call("eax", ["0", "0x1000", "0x1000", "0x104"])
+            + "movzx eax, byte ptr [eax]\n"),
+     0xE0000002)
+
+# --- reserve-only region fails closed on read ---
+case("wholememory_reserve_read_faults",
+     a64 + ("xor ecx, ecx\nmov rdx, 0x1000\nmov r8d, 0x2000\nxor r9d, r9d\ncall rax\n"
+            "movzx eax, byte ptr [rax]\n"),
+     a86 + (guestkit.x86call("eax", ["0", "0x1000", "0x2000", "0"])
+            + "movzx eax, byte ptr [eax]\n"),
+     0xE0000002)
+
 # --- fail-closed names stay fail-closed -------------------------------------
 a64, a86 = _load_gpa("kernel32.dll", "NopeNopeNope", SCR, SCR + 0x20)
 case("gpa_failclosed",

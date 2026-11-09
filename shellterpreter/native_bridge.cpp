@@ -2,6 +2,7 @@
 #include "vm.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 
 namespace stub {
 
@@ -18,14 +19,13 @@ static void registerModules(Loaded& l) {
         HMODULE h = GetModuleHandleA(name);
         if (!h) h = LoadLibraryA(name);
         if (!h) continue;
+        // Loader-reported extent, not a hand-parsed PE header: a corrupt
+        // header must cost a module, never the interpreter.
+        MODULEINFO mi{};
+        if (!GetModuleInformation(GetCurrentProcess(), h, &mi, sizeof(mi))) continue;
         const auto base = reinterpret_cast<uint64_t>(h);
-        const auto lfanew = *reinterpret_cast<uint32_t*>(base + 0x3C);
-        // SizeOfImage: OptionalHeader is at lfanew+0x18 (FileHeader), and
-        // its ImageBase-relative offset of SizeOfImage = +0x38 for BOTH
-        // PE32 and PE32+ -> absolute nt+0x50
-        const uint8_t* nt = reinterpret_cast<const uint8_t*>(base) + lfanew;
-        const uint32_t sizeOfImage = *reinterpret_cast<const uint32_t*>(nt + 0x50);
-        l.realMods[l.realModCount] = ModuleRange{ base, base + sizeOfImage };
+        if (mi.SizeOfImage < 0x1000 || mi.SizeOfImage > 0x10000000) continue;
+        l.realMods[l.realModCount] = ModuleRange{ base, base + mi.SizeOfImage };
         ++l.realModCount;
     }
 }
