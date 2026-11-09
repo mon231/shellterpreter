@@ -1,7 +1,10 @@
 #include "api_standins.hpp"
 #include "guest_environment.hpp"
+#include "native_bridge.hpp"
 #include <cstdio>
 #include <cstring>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 namespace stub {
 
@@ -35,6 +38,13 @@ static bool startsWithNoCase(const char* s, const char* prefix) {
 static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
     char name[64];
     if (!guestStr(l, args[0], name)) return 0;
+    // batch D: whitelisted system modules now resolve to their real base;
+    // calls into them go through the native bridge, everything else keeps
+    // the interpreter's fake module layout
+    for (uint32_t i = 0; i < l.realModCount; ++i) {
+        // realMods are keyed by the same whitelist order as registerModules
+        if (nameEq(name, kNativeModuleNames[i])) return l.realMods[i].base;
+    }
     if (nameEq(name, "kernel32.dll") || nameEq(name, "kernelbase.dll")) {
         return l.env.base() + K32_RVA;
     }
@@ -54,8 +64,7 @@ static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
 static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (args[1] < kOrdinalMax) return 0; // ordinal imports not emulated
     char name[64];
-    if (!guestStr(l, args[1], name)) return 0;
-    if (nameEq(name, "LoadLibraryA"))  return l.env.base() + ST_LL_A;
+    if (!guestStr(l, args[1], name)) return 0;    if (nameEq(name, "LoadLibraryA"))  return l.env.base() + ST_LL_A;
     if (nameEq(name, "GetProcAddress")) return l.env.base() + ST_GP_A;
     if (nameEq(name, "MessageBoxA"))   return l.env.base() + ST_MB_A;
     if (nameEq(name, "printf"))        return l.env.base() + ST_PRINTF_A;
@@ -117,6 +126,14 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "RtlCaptureContext") ||
         nameEq(name, "RtlLookupFunctionEntry") ||
         nameEq(name, "RtlVirtualUnwind")) return l.env.base() + ST_CRTFAIL;
+    // batch D: names the interpreter does not intercept resolve against the
+    // real module when the guest passed one; the returned address runs the
+    // native bridge
+    for (uint32_t i = 0; i < l.realModCount; ++i) {
+        if (args[0] != l.realMods[i].base) continue;
+        const FARPROC p = ::GetProcAddress(reinterpret_cast<HMODULE>(args[0]), name);
+        return reinterpret_cast<uint64_t>(p);
+    }
     return 0;
 }
 
@@ -450,6 +467,7 @@ static uint64_t apiEhRaise(Loaded& l, const uint64_t* args) {
 }
 
 void registerApiStandins(Loaded& l) {
+    initNativeBridge(l);
     const uint32_t B = static_cast<uint32_t>(l.env.base());
     const ApiEntry apis[] = {
         { B + ST_NT_A, 2, false, apiRtlAdd },

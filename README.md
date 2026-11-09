@@ -61,7 +61,19 @@ both archs):
   guest-declared descriptor for image-relative services.
 - **OS-facing services**: WinAPI/CRT stand-in table (LoadLibraryA-style
   imports, MessageBox, CRT printf/rand/srand, thread creation, resource
-  APIs, RaiseException) — compiled in, never real API calls.
+  APIs, RaiseException) — compiled in, never real API calls; guest
+  pointers stay emulated.
+- **Native bridge**: `LoadLibraryA`/`GetProcAddress` stand-ins can hand
+  out real kernel32/user32/ntdll/gdi32/advapi32 addresses (whitelisted
+  modules resolve to their real bases) and a guest `call`/`jmp` into any
+  whitelisted module range runs the real function through a native
+  bridge — x64 through the C ABI, x86 through a naked-asm stdcall bridge
+  (x86 host only) — with only `RAX`/`EAX` carrying the return value back.
+  Whole-memory data access: reads on any committed readable page (via
+  VirtualQuery fallback), writes on writable pages; code pages stay
+  read-only. `syscall` (x64) dispatches the guest's NT number to the real
+  ntdll stub through the bridge, table built by scanning ntdll `Nt*`
+  export prologues; anything else fails closed.
 - **Exceptions**: guest C++ throw/catch and SEH with real unwind metadata
   (x64 FH4 tables, x86 FS:[0] chain + scope tables), handlers run as
   funclets; uncovered constructs fail closed.
@@ -71,17 +83,15 @@ both archs):
   instruction budget (`SHELLTERP_BUDGET`) with `0xE0000009` on exhaustion;
   executable-region audit before/after every run.
 
-Not yet implemented (planned, in order):
+Remaining top-down (largest first):
 
-- **Whole-memory guest access** — currently guest data access is limited
-  to the declared image/stack regions; extend access and pointer handling
-  so emulated code can read/write anywhere in the interpreter-owned
-  address space.
-- **Arbitrary function invocation via native stubs/gadgets** — guest
-  `call`/`jmp` into a prepared thunk/gadget region and return, with the
-  full register file (GPRs, xmm, flags) emulated correctly across the
-  transition, so shellcode can invoke any resident stand-in or prepared
-  code path, not just the fixed import endpoints.
+- **x86 native bridge on x86 host only** — the naked-asm x86 bridge runs
+  a real function only under a 32-bit interpreter build; under an x64
+  build the x86 core fails closed (`0xE000000A`). x64 bridges and the
+  x64 syscall dispatch run natively on an x64 build. Float/xmm returns
+  and varargs `AL` are not modeled across a bridge; `jmp` into a bridge
+  pops a garbage return address (accepted, fetch-outside fails closed
+  after the return).
 - **More user-mode instruction families** as real-world corpora demand
   them (fuzzing continues to surface gaps; everything else already fails
   closed).
@@ -104,6 +114,7 @@ returns normally it is the low 32 bits of `RAX`/`EAX`; the range
 | `0xE0000007` | architecture mismatch (32-bit build + x64 shellcode, wrong `--x86`/`--x64` flag) |
 | `0xE0000008` | bad command line |
 | `0xE0000009` | instruction budget exhausted |
+| `0xE000000A` | native bridged call escaped via exception (fail closed) |
 
 ## Design and choices
 

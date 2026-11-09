@@ -124,6 +124,7 @@
     <ClCompile Include="instruction_decoder.cpp" />
     <ClCompile Include="guest_environment.cpp" />
     <ClCompile Include="api_standins.cpp" />
+    <ClCompile Include="native_bridge.cpp" />
     <ClCompile Include="cpu.cpp" />
     <ClCompile Include="audit.cpp" />
     <ClCompile Include="fault.cpp" />
@@ -135,6 +136,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vm.hpp" />
+    <ClInclude Include="native_bridge.hpp" />
             <ClInclude Include="api_table.hpp" />
     <ClInclude Include="instruction_decoder.hpp" />
     <ClInclude Include="operand.hpp" />

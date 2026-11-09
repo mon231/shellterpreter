@@ -66,11 +66,20 @@ struct ThreadContext {
     bool     done;
 };
 
+// Batch D: whitelisted real system module (kernel32/user32/ntdll/...):
+// guest call/jmp into the range runs a native bridge stub (native_bridge).
+struct ModuleRange {
+    uint64_t base = 0;
+    uint64_t end = 0;
+};
+
 struct Loaded {
     GuestRegion img;   // the whole mapped blob: image bytes + header + slack
     GuestRegion stk;
     GuestRegion env;
     GuestRegion heap;
+    ModuleRange realMods[8];
+    uint32_t realModCount = 0;
     uint64_t fsBase;
     uint64_t gsBase;
     uint64_t heapNext;  // bump allocator cursor inside heap

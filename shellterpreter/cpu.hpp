@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "vm.hpp"
 #include "guest_environment.hpp"
+#include "native_bridge.hpp"
 #include "instruction_decoder.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -47,15 +48,43 @@ template <class T, class EmuT> uint8_t* addrPtr(EmuT& e, uint64_t addr) {
     }
     return nullptr;
 }
+// Whole-memory helper (batch D): accepts any committed host page; reads on
+// readable pages only, writes on writable pages only (code pages stay RO:
+// every write outside the guest regions fails closed with 0xE0000002).
+inline bool hostPageAddr(uint64_t addr, uint64_t size, bool forWrite, uint8_t*& p) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (addr > 0xFFFF000000000000ull) return false;
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<size_t>(addr)), &mbi, sizeof(mbi)))
+        return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD prot = mbi.Protect & ~PAGE_GUARD;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (prot & PAGE_NOACCESS) return false;
+    if (forWrite ? !(prot & writable) : !(prot & readable)) return false;
+    const uint64_t base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+    const uint64_t len = static_cast<uint64_t>(mbi.RegionSize);
+    if (addr < base || size > len || addr - base > len - size) return false;
+    p = reinterpret_cast<uint8_t*>(addr); // guest pointers are already host pointers
+    return true;
+}
 template <class T, class EmuT> bool memLd(EmuT& e, uint64_t addr, T& out) {
     uint8_t* p = addrPtr<T>(e, addr);
-    if (!p) return false;
+    if (!p) {
+        // whole-memory fallback: any committed, readable host page (batch D).
+        // Covers memory real stand-ins hand out (VirtualAlloc results, live
+        // module images). Writes stay restricted to writable pages.
+        if (!hostPageAddr(addr, sizeof(T), false, p)) return false;
+    }
     memcpy(&out, p, sizeof(T));
     return true;
 }
 template <class T, class EmuT> bool memSt(EmuT& e, uint64_t addr, T v) {
     uint8_t* p = addrPtr<T>(e, addr);
-    if (!p) return false;
+    if (!p) {
+        if (!hostPageAddr(addr, sizeof(T), true, p)) return false;
+    }
     memcpy(p, &v, sizeof(T));
     return true;
 }
@@ -2344,7 +2373,24 @@ private:
                     c.e.r[0] = c.e.r[1] = c.e.r[2] = c.e.r[3] = 0;
                 return fault_code(Fault::None);
             }
-            case 0x05: case 0x34: case 0x35:
+            case 0x05: { // syscall (x64 only): eax = NT syscall number -> native ntdll Nt*
+                if constexpr (is64) {
+                    void* fn = syscallFnFor(static_cast<uint32_t>(c.e.r[0]));
+                    if (!fn) return fault_code(Fault::UnsupportedInstruction);
+                    uint64_t args[16] = { c.e.r[1], c.e.r[2], c.e.r[8], c.e.r[9], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                    for (int i = 4; i < 16; ++i) {
+                        uint64_t v;
+                        if (memLd<uint64_t>(c.e, c.e.r[kRSP] + 0x28 + 8 * (i - 4), v)) args[i] = v;
+                    }
+                    uint64_t out = 0;
+                    if (!callNativeWin64(reinterpret_cast<uint64_t>(fn), args, out))
+                        return fault_code(Fault::NativeFault);
+                    c.e.r[0] = out;
+                    return fault_code(Fault::None);
+                }
+                return fault_code(Fault::UnsupportedInstruction); // x86: 0F 05 invalid
+            }
+            case 0x34: case 0x35:
                 return fault_code(Fault::UnsupportedInstruction);
             case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
             case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
@@ -3196,13 +3242,50 @@ private:
                 continue;
             }
             if (e.budget == 0) return fault_code(Fault::Budget);
-            --e.budget;
+            // batch D: call/jmp into a whitelisted real system module runs a
+            // native bridge (esp/rsp adjusted as the real callee cleans);
+            // anything else stays fail-closed fetch-outside-image.
             if (e.ip < l.img.base() || e.ip >= e.imgEnd) {
+                if (isNativeModuleAddr(l, e.ip)) {
+                    --e.budget;
+                    uint64_t ret = 0;
+                    if constexpr (is64) {
+                        if (!memLd<uint64_t>(e, e.r[kRSP], ret)) return fault_code(Fault::OutsideMemory);
+                        e.r[kRSP] += 8;
+                        uint64_t args[16] = { e.r[1], e.r[2], e.r[8], e.r[9], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                        for (int i = 4; i < 16; ++i) {
+                            uint64_t v;
+                            if (memLd<uint64_t>(e, e.r[kRSP] + 0x20 + 8 * (i - 4), v)) args[i] = v;
+                        }
+                        uint64_t out = 0;
+                        if (!callNativeWin64(e.ip, args, out)) return fault_code(Fault::NativeFault);
+                        e.r[0] = out;
+                    } else {
+                        uint32_t args[16] = {};
+                        for (int i = 0; i < 16; ++i) {
+                            uint32_t v;
+                            if (memLd<uint32_t>(e, e.r[kRSP] + 4 + 4 * i, v)) args[i] = v;
+                        }
+                        uint32_t ret32 = 0, nargs = 0, out = 0;
+                        if (!memLd<uint32_t>(e, e.r[kRSP], ret32)) return fault_code(Fault::OutsideMemory);
+                        if (!callNativeWin86(e.ip, args, out, nargs)) return fault_code(Fault::NativeFault);
+                        e.r[0] = static_cast<uint32_t>(out);
+                        // stdcall: callee popped ret + nargs dwords; a cdecl
+                        // callee measures nargs = 0 and the guest cleans its
+                        // own args afterwards
+                        e.r[kRSP] += 4 * (1 + nargs);
+                        ret = ret32;
+                    }
+                    ehRetPop(l, ret, e.r[kRSP]);
+                    e.ip = ret;
+                    continue;
+                }
                 fprintf(stderr, "instruction fetch outside image: ip=0x%llX (off=0x%llX)\n",
                         (unsigned long long)e.ip,
                         (unsigned long long)(e.ip - l.img.base()));
                 return fault_code(Fault::OutsideMemory);
             }
+            --e.budget;
             Fetch f{l.img.data(), l.img.size(), static_cast<size_t>(e.ip - l.img.base())};
             Ctx c{e, l, f};
             const uint32_t r = stepOne(c);
@@ -3217,6 +3300,10 @@ private:
                     fprintf(stderr, "fault: unimplemented opcode at ip=0x%llX (off=0x%llX)\n",
                             static_cast<unsigned long long>(e.ip),
                             static_cast<unsigned long long>(e.ip - l.img.base()));
+                }
+                if (r == fault_code(Fault::NativeFault)) {
+                    fprintf(stderr, "fault: native bridge call escaped via exception at ip=0x%llX\n",
+                            static_cast<unsigned long long>(e.ip));
                 }
                 return r;
             }

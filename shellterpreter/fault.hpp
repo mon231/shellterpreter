@@ -15,6 +15,7 @@ enum class Fault : uint32_t {
     Architecture = 0xE0000007u,
     Argument = 0xE0000008u,
     Budget = 0xE0000009u,
+    NativeFault = 0xE000000Au,
 };
 
 uint32_t fault_code(Fault value);

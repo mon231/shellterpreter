@@ -26,6 +26,8 @@ std::string fault_message(uint32_t fault) {
         return "bad command line";
     case Fault::Budget:
         return "instruction budget exhausted";
+    case Fault::NativeFault:
+        return "native bridge call faulted";
     default:
         return "unknown state";
     }
