@@ -1,4 +1,6 @@
 import conftest
+
+import guestkit
 import re
 
 # Iteration 13: x87 value tests (batch C of "all user-mode opcodes").
@@ -7,52 +9,11 @@ import re
 # body, writes its result into EAX and halts (exit code = EAX). Expected
 # values are real-x87 semantics; float constants are IEEE-754 bits.
 
-from keystone import Ks, KsError
-import keystone as _ks
-
-PRO64 = "sub rsp, 0x40\ncld\n"
-PRO86 = "sub esp, 0x40\ncld\n"
-
-_X86REG = {"rax": "eax", "rbx": "ebx", "rcx": "ecx", "rdx": "edx",
-           "rsi": "esi", "rdi": "edi", "rbp": "ebp", "rsp": "esp"}
-
-
-def _x86asm(asm):
-    return re.sub(r"\b(rax|rbx|rcx|rdx|rsi|rdi|rbp|rsp)\b", lambda m: _X86REG[m.group(0)], asm)
-
-
-def _blob(asm, is64):
-    ks = Ks(_ks.KS_ARCH_X86, _ks.KS_MODE_64) if is64 else Ks(_ks.KS_ARCH_X86, _ks.KS_MODE_32)
-    pro = ks.asm(PRO64 if is64 else PRO86)[0]
-    body = ks.asm(asm)[0]
-    tail = ks.asm("hlt\n")[0]
-    return bytes(pro) + bytes(body) + bytes(tail)
-
-
-def _exit_code(blobbytes, is64, tmp_path, tag):
-    exe = conftest.X64_DIR if is64 else conftest.X86_DIR
-    p = (tmp_path / tag).with_suffix(".shellcode")
-    p.write_bytes(blobbytes)
-    r = conftest.run([str(exe / "shellterpreter.exe"), str(p)])
-    rc = r.returncode
-    code = conftest.win_code(rc) if rc < 0 else (rc & 0xFFFFFFFF)
-    return code, r.stderr
-
-
 def _run_case(name, asm64, asm86, expect, tmp_path):
-    # asm86 None = same asm on both (r-named registers auto-converted);
-    # asm86 "" = x64-only
-    asm86_fallback = _x86asm(asm64) if asm86 is None else asm86
-    for is64, asm in ((True, asm64), (False, asm86_fallback)):
-        if asm is None:
-            continue
-        expect_ = (expect[0] if is64 else expect[1]) if isinstance(expect, tuple) else expect
-        try:
-            b = _blob(asm, is64)
-        except KsError as e:
-            raise AssertionError(f"{name} [{'x64' if is64 else 'x86'}] failed to assemble: {e}")
-        code, err = _exit_code(b, is64, tmp_path, name.replace("/", "_").replace(",", "_"))
-        assert code == expect_, f"{name} [{'x64' if is64 else 'x86'}]: exit {code:#x} != {expect_:#x}\n{err[-800:]}"
+    # legacy markers: asm86 None = 64->32 rename fallback; "" = x64-only
+    guestkit.run_case(name, asm64,
+                      guestkit.X64_ONLY if asm86 == "" else asm86,
+                      expect, tmp_path)
 
 
 CASES = [
@@ -201,7 +162,7 @@ def test_fcmovb_not_taken(tmp_path):
            "fld qword ptr [rsp]\nfld qword ptr [rsp+8]\n"  # st0=9, st1=3
            "fucomi st(1)\nfcmovb st, st(1)\n"  # 9 !< 3 -> no move
            "fistp dword ptr [rsp+16]\nmov eax, dword ptr [rsp+16]")
-    code, err = _exit_code(_blob(asm, True), True, tmp_path, "fcmovb_not")
+    code, err = guestkit.exit_code(guestkit.blob(asm, True), True, tmp_path, "fcmovb_not")
     assert code == 9, f"fcmovb_not_taken: exit {code:#x}\n{err[-800:]}"  # 9 stays (float 3.0 would trap to 3)
 
 

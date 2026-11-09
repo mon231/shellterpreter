@@ -1,19 +1,17 @@
 import conftest
 import struct
 
+import guestkit
+import keystone as _ks
+from keystone import Ks
+
+
 # Iteration 11: integer-opcode coverage (batch A of "all user-mode opcodes").
 #
 # Raw keystone-assembled blobs: body runs on the interpreter, writes its
 # result into EAX, and terminates with hlt (exit code = EAX). Expected
 # values are real-x86 semantics; several expected CRC values are computed
 # here with the same Castagnoli algorithm the hardware uses.
-
-from keystone import Ks, KsError
-import keystone as _ks
-
-PRO64 = "sub rsp, 0x40\ncld\n"
-PRO86 = "sub esp, 0x40\ncld\n"
-
 
 _CRC32B64 = "mov rbx, 0x31\nxor eax, eax\ncrc32 eax, bl"
 _CRC32B86 = "mov ebx, 0x31\nxor eax, eax\ncrc32 eax, bl"
@@ -33,41 +31,13 @@ CRC32B_EXPECT = _crc32c_intel(0, struct.pack("<B", 0x31))
 CRC32Q_EXPECT = _crc32c_intel(0, struct.pack("<Q", 0x1122334455667788))
 
 
-KS64 = Ks(Ks.KS_ARCH_X86, Ks.KS_MODE_64) if hasattr(Ks, "KS_ARCH_X86") else None
-
-
-def _blob(asm, is64):
-    ks = Ks(_ks.KS_ARCH_X86, _ks.KS_MODE_64) if is64 else Ks(_ks.KS_ARCH_X86, _ks.KS_MODE_32)
-    pro, _ = ks.asm(PRO64 if is64 else PRO86)
-    body, _ = ks.asm(asm)
-    tail, _ = ks.asm("hlt\n")
-    return bytes(pro) + bytes(body) + bytes(tail)
-
-
-def _exit_code(blobbytes, is64, tmp_path):
-    exe = conftest.X64_DIR if is64 else conftest.X86_DIR
-    p = (tmp_path / ("probe64" if is64 else "probe86")).with_suffix(".shellcode")
-    p.write_bytes(blobbytes)
-    r = conftest.run([str(exe / "shellterpreter.exe"), str(p)])
-    rc = r.returncode
-    code = conftest.win_code(rc) if rc < 0 else (rc & 0xFFFFFFFF)
-    return code, r.stderr
-
-
 def _run_case(name, asm64, asm86, expect, tmp_path):
-    # asm86 None = same asm on both; asm86 "" = x64-only
-    for is64, asm in ((True, asm64), (False, asm86 if (asm86 is not None and asm86 != "") else (None if asm86 == "" else asm64))):
-        if asm is None:
-            continue
-        try:
-            b = _blob(asm, is64)
-        except KsError as e:
-            raise AssertionError(f"{name} [{'x64' if is64 else 'x86'}] failed to assemble: {e}")
-        code, err = _exit_code(b, is64, tmp_path)
-        assert code == expect, f"{name} [{'x64' if is64 else 'x86'}]: exit {code:#x} != {expect:#x}\n{err[-800:]}"
+    # legacy markers: asm86 None = 64->32 rename fallback; "" = x64-only
+    guestkit.run_case(name, asm64,
+                      guestkit.X64_ONLY if asm86 == "" else asm86,
+                      expect, tmp_path)
 
 
-# (name, x64 asm, x86 asm-or-None (=x64), expected exit)
 CASES = [
     # mul / imul family
     ("mul64high", "mov rax, 0x8000000000000000\nmov rbx, 2\nmul rbx\nmov eax, edx",
@@ -140,19 +110,18 @@ def test_nop_forms(tmp_path):
             b"\xF3\x0F\x1E\xFA\xF3\x0F\x1E\xFB")  # endbr32 endbr64
     for is64 in (True, False):
         b = _blob_raw(body, is64)
-        code, err = _exit_code(b, is64, tmp_path)
+        code, err = guestkit.exit_code(b, is64, tmp_path, "nop_forms")
         assert code == 0x55, f"nop forms [{'x64' if is64 else 'x86'}]: exit {code:#x}\n{err[-800:]}"
 
 
 def _blob_raw(asm_bytes, is64):
     ks = (Ks(_ks.KS_ARCH_X86, _ks.KS_MODE_64) if is64 else Ks(_ks.KS_ARCH_X86, _ks.KS_MODE_32))
-    pro, _ = ks.asm(PRO64 if is64 else PRO86)
-    tail_asm = "mov eax, 0x55\nhlt\n"
-    tail, _ = ks.asm(tail_asm)
+    pro, _ = ks.asm(guestkit.PRO64 if is64 else guestkit.PRO86)
+    tail, _ = ks.asm("mov eax, 0x55\nhlt\n")
     return bytes(pro) + asm_bytes + bytes(tail)
 
 
 def test_pause(tmp_path):
     for is64 in (True, False):
-        code, err = _exit_code(_blob("mov eax, 0x55\npause", is64), is64, tmp_path)
+        code, err = guestkit.exit_code(guestkit.blob("mov eax, 0x55\npause", is64), is64, tmp_path, "pause")
         assert code == 0x55, f"pause [{'x64' if is64 else 'x86'}]: exit {code:#x}\n{err[-800:]}"
