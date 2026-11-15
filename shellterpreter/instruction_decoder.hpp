@@ -17,6 +17,8 @@ enum class Architecture { X64, X86 };
 // byte/word fetch cursor over the image
 struct Fetch {
     const uint8_t* data; size_t len; size_t pos;
+    // guest ip of data[0]: next-ip and rip-relative EAs are pos-relative
+    uint64_t ipBase = 0;
     uint8_t u8() { return data[pos++]; }
     uint16_t u16() { uint16_t v; memcpy(&v, data + pos, 2); pos += 2; return v; }
     uint32_t u32() { uint32_t v; memcpy(&v, data + pos, 4); pos += 4; return v; }

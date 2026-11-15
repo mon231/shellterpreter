@@ -22,6 +22,7 @@ namespace stub {
 //   0x1DB0 _callnewh stand-in             0x1DC0 fail-closed CRT helper
 //   0x1F00 fake CRT/MSVC module handle (ucrt/msvcp/vcruntime/api-set, no image)
 //   0x1800 fake user32 module handle (no image; GetProcAddress never walks it)
+//   0xCF0  GetModuleFileNameW stand-in    0xD00  GetModuleFileNameA stand-in
 constexpr uint32_t K32_RVA    = 0x800;
 constexpr uint32_t USER32_RVA = 0x1800;
 constexpr uint32_t NTDLL_RVA  = 0x1000;
@@ -54,6 +55,8 @@ constexpr uint32_t ST_RAISE    = 0x1E28; // RaiseException
 constexpr uint32_t ST_CXXFRAME4 = 0x1E30; // __CxxFrameHandler4
 constexpr uint32_t ST_CXXFRAME3 = 0x1E38; // __CxxFrameHandler3
 constexpr uint32_t ST_EH3       = 0x1E40; // _except_handler3
+constexpr uint32_t ST_ARGS      = 0x1E48; // _getmainargs / __getmainargs
+constexpr uint32_t ST_WARGS     = 0x1E50; // _wgetmainargs / __wgetmainargs
 // kernel32 slack (no export data below 0x1000): CRT-startup API stand-ins
 constexpr uint32_t ST_GSFT   = 0xC00; // GetSystemTimeAsFileTime
 constexpr uint32_t ST_QPC    = 0xC10; // QueryPerformanceCounter
@@ -62,6 +65,14 @@ constexpr uint32_t ST_SLIST  = 0xC30; // InitializeSListHead
 constexpr uint32_t ST_UEHF   = 0xC40; // UnhandledExceptionFilter
 constexpr uint32_t ST_SUEH   = 0xC50; // SetUnhandledExceptionFilter
 constexpr uint32_t ST_IPP    = 0xC60; // IsProcessorFeaturePresent
+// kernel32 slack trampoline: _initterm emits a callback loop here
+constexpr uint32_t ST_TRAMP  = 0xC80;
+constexpr uint32_t ST_INITTERM = 0xCB0; // trampoline above is 0x27 bytes
+constexpr uint32_t ST_MODH   = 0xCC0; // GetModuleHandleW/A
+constexpr uint32_t ST_FMT    = 0xCD0; // FormatMessageW
+constexpr uint32_t ST_EXIT   = 0xCE0; // exit/_exit/_amsg_exit
+constexpr uint32_t ST_MODFNW = 0xCF0; // GetModuleFileNameW
+constexpr uint32_t ST_MODFNA = 0xD00; // GetModuleFileNameA
 constexpr uint32_t MSVCRT_RVA  = 0x1E00;
 constexpr uint32_t CRTRT_RVA   = 0x1F00;
 

@@ -8,14 +8,19 @@ namespace stub {
 
 // ---- module registry -------------------------------------------------
 
-const char* const kNativeModuleNames[6] = {
+const char* const kNativeModuleNames[19] = {
     "kernel32.dll", "kernelbase.dll", "ntdll.dll",
     "user32.dll", "gdi32.dll", "advapi32.dll",
+    "iphlpapi.dll", "ws2_32.dll", "dnsapi.dll",
+    "nsi.dll", "dhcpcsvc.dll", "dhcpcsvc6.dll",
+    "msvcrt.dll", "mswsock.dll",
+    "version.dll", "authz.dll", "sspicli.dll", "wkscli.dll", "netutils.dll",
 };
 
 static void registerModules(Loaded& l) {
-    for (const char* name : kNativeModuleNames) {
-        if (l.realModCount >= 8) break;
+    for (uint32_t i = 0; i < 19; ++i) {
+        if (l.realModCount >= 24) break;
+        const char* name = kNativeModuleNames[i];
         HMODULE h = GetModuleHandleA(name);
         if (!h) h = LoadLibraryA(name);
         if (!h) continue;
@@ -26,6 +31,8 @@ static void registerModules(Loaded& l) {
         const auto base = reinterpret_cast<uint64_t>(h);
         if (mi.SizeOfImage < 0x1000 || mi.SizeOfImage > 0x10000000) continue;
         l.realMods[l.realModCount] = ModuleRange{ base, base + mi.SizeOfImage };
+        fprintf(stderr, "TRC REG [%u]=%s base=%llX end=%llX\n", l.realModCount, name,
+                (unsigned long long)base, (unsigned long long)(base + mi.SizeOfImage));
         ++l.realModCount;
     }
 }
@@ -152,3 +159,27 @@ bool callNativeWin86(uint64_t, const uint32_t[16], uint32_t&, uint32_t&) { retur
 #endif
 
 } // namespace stub
+
+// Whole-memory helper (batch D): accepts any committed host page; reads on
+// readable pages only, writes on writable pages only (code pages stay RO:
+// every write outside the guest regions fails closed with 0xE0000002).
+bool hostPageAddr(uint64_t addr, uint64_t size, bool forWrite, uint8_t*& p) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (addr > 0xFFFF000000000000ull) return false;
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<size_t>(addr)), &mbi, sizeof(mbi)))
+        return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD prot = mbi.Protect;
+    // guard and no-access pages fail closed: touching the page would raise
+    // an uncaught STATUS_GUARD_PAGE_VIOLATION, not a fault (hardening batch)
+    if (prot & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (forWrite ? !(prot & writable) : !(prot & readable)) return false;
+    const uint64_t base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+    const uint64_t len = static_cast<uint64_t>(mbi.RegionSize);
+    if (addr < base || size > len || addr - base > len - size) return false;
+    p = reinterpret_cast<uint8_t*>(addr); // guest pointers are already host pointers
+    return true;
+}

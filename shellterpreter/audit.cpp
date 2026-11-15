@@ -45,6 +45,7 @@ bool pageIsWriteAndExec(uint64_t addr) {
 bool noNewExec(const std::vector<stub::ExecAudit::ExecRange>& baseline) {
     std::vector<stub::ExecAudit::ExecRange> now = snapshot();
     if (now.size() != baseline.size()) return false;
+    if (now.size() != baseline.size()) return false;
     for (size_t i = 0; i < now.size(); ++i) {
         if (now[i].first != baseline[i].first) return false;
         if (now[i].second != baseline[i].second) return false;

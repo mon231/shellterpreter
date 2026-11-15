@@ -7,6 +7,13 @@
 #include "guest_region.hpp"
 #include "api_table.hpp"
 
+// Whole-memory helper (batch D): accepts any committed host page; reads on
+// readable pages only, writes on writable pages only (code pages stay RO:
+// every write outside the guest regions fails closed with 0xE0000002).
+// Defined in native_bridge.cpp; stand-ins use it for pointers the guest
+// obtained from native APIs (e.g. real HeapAlloc handles).
+bool hostPageAddr(uint64_t addr, uint64_t size, bool forWrite, uint8_t*& p);
+
 namespace stub {
 
 
@@ -74,20 +81,39 @@ struct ModuleRange {
 };
 
 struct Loaded {
+    // real system module helper: the module a name-based stand-in resolves to
+    // when the imported DLL is an api-set shim. realMods are filled in the
+    // kNativeModuleNames order: index 0 = kernel32, index 1 = kernelbase.
+    // Kernelbase implements the core api-set share; falls back to kernel32.
+    uint64_t realKbase() const {
+        if (realModCount > 1) return realMods[1].base;
+        if (realModCount > 0) return realMods[0].base;
+        return 0;
+    }
+
     GuestRegion img;   // the whole mapped blob: image bytes + header + slack
     GuestRegion stk;
     GuestRegion env;
     GuestRegion heap;
-    ModuleRange realMods[8];
+    ModuleRange realMods[24];
     uint32_t realModCount = 0;
     uint64_t fsBase;
     uint64_t gsBase;
+    // blob name: filename stem, reported by the stand-ins as the guest's own
+    // module name (argv[0], module file name, MUI paths)
+    char name[32] = {};
     uint64_t heapNext;  // bump allocator cursor inside heap
     uint64_t heapEnd;
     ApiTable apis;
     ThreadContext threads[8];
     uint32_t threadCount;
     uint32_t fault; // stand-in sets this to fail closed
+    // stand-in asks the dispatch loop to continue execution here instead of
+    // returning (apiInitterm trampoline); cleared once consumed
+    uint64_t tailJump = 0;
+    // TEMP batch G debugging: ring of the last executed in-image ips
+    uint64_t* ipRing = nullptr;
+    uint32_t ipRingIdx = 0;
     // iteration 6: guest exception machinery state
     EhCallFrame ehLog[kEhLogMax];
     uint32_t ehLogCount = 0;

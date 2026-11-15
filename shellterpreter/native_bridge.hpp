@@ -12,8 +12,12 @@ struct Loaded;
 // the return value back. Whole-memory guest access covers the real pages.
 
 // Whitelisted real system modules; registerModules fills realMods in this
-// order, and the LoadLibraryA stand-in keys names by it.
-extern const char* const kNativeModuleNames[6];
+// order. The first six are the interpreter's candidates — everything after
+// them is what real porcelain binaries import for their working set
+// (ipconfig needs iphlpapi/ws2_32/dnsapi/nsi/dhcpcsvc*, and its static CRT
+// surface resolves through the real msvcrt export table); preloading them
+// before the exec-audit snapshot keeps the audit from seeing new exec pages.
+extern const char* const kNativeModuleNames[19];
 
 // True when addr lies inside one of the whitelisted native modules.
 bool isNativeModuleAddr(const Loaded& l, uint64_t addr);

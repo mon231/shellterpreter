@@ -11,6 +11,20 @@
 #include "api_standins.hpp"
 #include "shellcode_file.hpp"
 
+// TEMP batch G: triage native access violations (remove before commit)
+namespace {
+LONG WINAPI vehTriage(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005) {
+        fprintf(stderr, "TRC AV rip=%llX access=%llX addr=%llX\n",
+                static_cast<unsigned long long>(ep->ContextRecord->Rip),
+                static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[0]),
+                static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]));
+        fflush(stderr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+}
+
 namespace stub {
 
 uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
@@ -33,6 +47,17 @@ uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
         return fault_code(Fault::Allocation);
     memcpy(out.img.data(), data.data(), data.size());
 
+    // filename stem: what the stand-ins report as the guest's own module name
+    {
+        const size_t sep = path.find_last_of("/\\");
+        std::string stem = (sep == std::string::npos) ? path : path.substr(sep + 1);
+        const size_t dot = stem.find_last_of('.');
+        if (dot != std::string::npos) stem = stem.substr(0, dot);
+        const size_t n = stem.size() < sizeof(out.name) ? stem.size() : sizeof(out.name) - 1;
+        memcpy(out.name, stem.c_str(), n);
+        out.name[n] = '\0';
+    }
+
     const uint64_t stack_size = 4 * 1024 * 1024;
     if (!out.stk.allocate(stack_size, below4))
         return fault_code(Fault::Allocation);
@@ -53,6 +78,7 @@ static void printFault(uint32_t code) {
 }
 
 int main(int argc, char** argv) {
+    AddVectoredExceptionHandler(0, vehTriage); // TEMP batch G
     std::string path;
     int arch = 0;
     for (int i = 1; i < argc; ++i) {
