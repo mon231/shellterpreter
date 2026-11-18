@@ -17,7 +17,11 @@ struct Loaded;
 // (ipconfig needs iphlpapi/ws2_32/dnsapi/nsi/dhcpcsvc*, and its static CRT
 // surface resolves through the real msvcrt export table); preloading them
 // before the exec-audit snapshot keeps the audit from seeing new exec pages.
-extern const char* const kNativeModuleNames[19];
+// The trailing winsock namespace/transport providers load inside real
+// WSAStartup (socket calls enumerate the Winsock catalog), which would create
+// new exec regions after the snapshot; preloading them keeps hostname-type
+// binaries audit-clean (batch H task 5b).
+extern const char* const kNativeModuleNames[24];
 
 // True when addr lies inside one of the whitelisted native modules.
 bool isNativeModuleAddr(const Loaded& l, uint64_t addr);
@@ -35,6 +39,6 @@ bool callNativeWin86(uint64_t fn, const uint32_t args[16], uint32_t& out, uint32
 void initNativeBridge(Loaded& l);
 
 // x64 host only: the native Nt* function for a syscall number, nullptr if unknown.
-void* syscallFnFor(uint32_t sysno);
+void* syscallFnFor(const Loaded& l, uint32_t sysno);
 
 } // namespace stub

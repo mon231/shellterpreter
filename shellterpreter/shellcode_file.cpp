@@ -3,7 +3,7 @@
 #include <windows.h>
 
 File::~File() {
-    if (_handle) {
+    if (_handle && _handle != INVALID_HANDLE_VALUE) {
         CloseHandle(_handle);
         _handle = nullptr;
     }

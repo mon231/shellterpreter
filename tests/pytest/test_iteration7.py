@@ -10,12 +10,14 @@ import os
 import pathlib
 import random
 import subprocess
+import tempfile
 
 import conftest
 
 FAULT_LO = 0xE0000001
 FAULT_HI = 0xE0000009
-TMP = pathlib.Path(r"C:\Users\avart\AppData\Local\Temp\opencode\fuzz")
+# per-session scratch dir: a hardcoded path was shared between runs
+TMP = pathlib.Path(tempfile.mkdtemp(prefix="shellterp_fuzz_"))
 # mutated code can wander through long paths; the budget keeps Debug builds
 # (slow per instruction) inside the timeout instead of tripping it.
 # Debug x87 heavy loops burn the 30s timeout at 5e7, so Debug uses 5e6.

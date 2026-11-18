@@ -64,7 +64,8 @@ bool ExecAudit::verify(uint64_t imageAddr, uint64_t stackAddr) const {
         return false;
     if (pageIsWriteAndExec(imageAddr) || pageIsWriteAndExec(stackAddr))
         return false;
-    return noNewExec(_ranges);
+    if (!noNewExec(_ranges)) return false;
+    return true;
 }
 
 } // namespace stub

@@ -100,7 +100,7 @@ Remaining top-down (largest first):
 
 The process exit code is the outcome of the run: for a shellcode that
 returns normally it is the low 32 bits of `RAX`/`EAX`; the range
-`0xE0000000..0xE0000009` is reserved for the interpreter's own diagnostics.
+`0xE0000000..0xE000000A` is reserved for the interpreter's own diagnostics.
 
 | Code | Meaning |
 |---|---|

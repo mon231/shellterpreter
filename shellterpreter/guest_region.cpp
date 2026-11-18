@@ -43,6 +43,9 @@ bool GuestRegion::allocate(uint64_t size, bool below4) {
                 return true;
             }
         }
+        // below-4GiB is the guest-pointer invariant: never fall back to an
+        // unconstrained VirtualAlloc; the caller maps false to Fault::Allocation
+        return false;
     }
     _data = static_cast<uint8_t*>(
         VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));

@@ -11,20 +11,6 @@
 #include "api_standins.hpp"
 #include "shellcode_file.hpp"
 
-// TEMP batch G: triage native access violations (remove before commit)
-namespace {
-LONG WINAPI vehTriage(EXCEPTION_POINTERS* ep) {
-    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005) {
-        fprintf(stderr, "TRC AV rip=%llX access=%llX addr=%llX\n",
-                static_cast<unsigned long long>(ep->ContextRecord->Rip),
-                static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[0]),
-                static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]));
-        fflush(stderr);
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-}
-
 namespace stub {
 
 uint32_t loadShellcode(const std::string& path, Loaded& out, bool force86) {
@@ -78,9 +64,7 @@ static void printFault(uint32_t code) {
 }
 
 int main(int argc, char** argv) {
-    AddVectoredExceptionHandler(0, vehTriage); // TEMP batch G
-    std::string path;
-    int arch = 0;
+    std::string path;    int arch = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--x86") arch = 32;

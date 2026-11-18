@@ -33,17 +33,19 @@ enum Reg {
 // argument-dependent lookup when operandRead/operandWrite are instantiated
 // with the emulator state, so the Cpu class keeps one copy of the logic.
 template <class T, class EmuT> uint8_t* addrPtr(EmuT& e, uint64_t addr) {
-    if (addr >= e.l->img.base() && addr + sizeof(T) <= e.imgEnd)
+    // addr <= end before the addr+sizeof(T) <= end compare: that sum wraps for
+    // addr near 2^64 and would hand memLd/memSt a wild host pointer otherwise
+    if (addr >= e.l->img.base() && addr <= e.imgEnd && addr + sizeof(T) <= e.imgEnd)
         return e.l->img.data() + (addr - e.l->img.base());
-    if (addr >= e.l->stk.base() && addr + sizeof(T) <= e.l->stk.base() + e.l->stk.size())
+    if (addr >= e.l->stk.base() && addr <= e.l->stk.base() + e.l->stk.size() && addr + sizeof(T) <= e.l->stk.base() + e.l->stk.size())
         return e.l->stk.data() + (addr - e.l->stk.base());
-    if (addr >= e.envBase && addr + sizeof(T) <= e.envEnd)
+    if (addr >= e.envBase && addr <= e.envEnd && addr + sizeof(T) <= e.envEnd)
         return e.l->env.data() + (addr - e.envBase);
-    if (addr >= e.l->heap.base() && addr + sizeof(T) <= e.l->heapEnd)
+    if (addr >= e.l->heap.base() && addr <= e.l->heapEnd && addr + sizeof(T) <= e.l->heapEnd)
         return e.l->heap.data() + (addr - e.l->heap.base());
     for (uint32_t i = 0; i < e.l->threadCount; ++i) {
         const GuestRegion& stack = e.l->threads[i].stack;
-        if (addr >= stack.base() && addr + sizeof(T) <= stack.base() + stack.size())
+        if (addr >= stack.base() && addr <= stack.base() + stack.size() && addr + sizeof(T) <= stack.base() + stack.size())
             return stack.data() + (addr - stack.base());
     }
     return nullptr;
@@ -54,15 +56,7 @@ template <class T, class EmuT> bool memLd(EmuT& e, uint64_t addr, T& out) {
         // whole-memory fallback: any committed, readable host page (batch D).
         // Covers memory real stand-ins hand out (VirtualAlloc results, live
         // module images). Writes stay restricted to writable pages.
-        if (!hostPageAddr(addr, sizeof(T), false, p)) {
-            fprintf(stderr, "TRC LDF fail addr=%llX sz=%zu ip=%llX rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX rbp=%llX r12=%llX r13=%llX r14=%llX r15=%llX rsp=%llX\n",
-                    (unsigned long long)addr, sizeof(T), (unsigned long long)e.ip,
-                    (unsigned long long)e.r[0], (unsigned long long)e.r[6], (unsigned long long)e.r[1], (unsigned long long)e.r[2],
-                    (unsigned long long)e.r[3], (unsigned long long)e.r[7], (unsigned long long)e.r[7],
-                    (unsigned long long)e.r[12], (unsigned long long)e.r[13], (unsigned long long)e.r[14],
-                    (unsigned long long)e.r[15], (unsigned long long)e.r[kRSP]);
-            return false;
-        }
+        if (!hostPageAddr(addr, sizeof(T), false, p)) return false;
     }
     memcpy(&out, p, sizeof(T));
     return true;
@@ -71,12 +65,6 @@ template <class T, class EmuT> bool memSt(EmuT& e, uint64_t addr, T v) {
     uint8_t* p = addrPtr<T>(e, addr);
     if (!p) {
         if (!hostPageAddr(addr, sizeof(T), true, p)) return false;
-    }
-    if constexpr (sizeof(T) == 8) { // TEMP batch G: watch writes into whoami option table
-        if (addr >= 0x43F370 && addr < 0x43F8A0)
-            fprintf(stderr, "TRC TBLW ip=%llX addr=%llX val=%016llX\n",
-                    (unsigned long long)(e.ip - e.l->img.base() - 0x360),
-                    (unsigned long long)addr, (unsigned long long)v);
     }
     memcpy(p, &v, sizeof(T));
     return true;
@@ -104,7 +92,6 @@ private:
         uint64_t imgEnd = 0, stkEnd = 0;
         uint64_t fsBase = 0, gsBase = 0, envBase = 0, envEnd = 0;
         uint64_t budget = kInstrBudget;
-        bool iatDumped = false;
     };
 
     struct Ctx {
@@ -879,7 +866,9 @@ private:
             else {
                 const uint64_t ea = c.eaCalc();
                 if (laneE == 4) {
-                    if (!memSt<uint64_t>(c.e, ea, bits & maskSz(is64d ? 8 : 4))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                    if (is64d) {
+                        if (!memSt<uint64_t>(c.e, ea, bits)) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
+                    } else if (!memSt<uint32_t>(c.e, ea, static_cast<uint32_t>(bits & maskSz(4)))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
                 } else if (!memSt(c.e, ea, static_cast<uint8_t>(bits))) { c.fault = fault_code(Fault::OutsideMemory); return c.fault; }
             }
             if (c.fault != fault_code(Fault::None)) return c.fault;
@@ -1231,6 +1220,7 @@ private:
     static uint32_t stepOne(Ctx& c) {
         Fetch& f = c.f;
         for (;;) {
+            if (f.pos >= f.len) return fault_code(Fault::OutsideMemory); // truncated blob: fetch outside image
             const uint8_t p = f.data[f.pos];
             switch (p) {
             case 0x66: c.op66 = true; ++f.pos; continue;
@@ -1720,7 +1710,7 @@ private:
         case 0xA6: case 0xA7: {
             if constexpr (is64) {
                 const int szCode = (op == 0xA6) ? 1 : (c.op66 ? 2 : (c.rexW ? 8 : 4));
-                const int stepv = c.e.df ? -1 : 1;
+                const int stepv = c.e.df ? -szCode : szCode;
                 for (;;) {
                     if (c.e.budget == 0) return fault_code(Fault::Budget);
                     --c.e.budget;
@@ -1733,11 +1723,11 @@ private:
                     c.e.r[7] = (di + stepv) & maskSz(8);
                     if (!c.rep) break;
                     --c.e.r[1];
-                    if (c.e.r[1] == 0 || !c.e.zf) break;
+                    if (c.e.r[1] == 0 || (c.repF2 ? c.e.zf : !c.e.zf)) break;
                 }
             } else {
                 const int szCode = (op == 0xA6) ? 1 : (c.op66 ? 2 : 4);
-                const int stepv = c.e.df ? -1 : 1;
+                const int stepv = c.e.df ? -szCode : szCode;
                 for (;;) {
                     if (c.e.budget == 0) return fault_code(Fault::Budget);
                     --c.e.budget;
@@ -1750,7 +1740,7 @@ private:
                     c.e.r[7] = (di + stepv) & maskSz(4);
                     if (!c.rep) break;
                     --c.e.r[1];
-                    if (c.e.r[1] == 0 || !c.e.zf) break;
+                    if (c.e.r[1] == 0 || (c.repF2 ? c.e.zf : !c.e.zf)) break;
                 }
             }
             return fault_code(Fault::None);
@@ -2070,7 +2060,9 @@ private:
                             const bool n2 = static_cast<int64_t>(dd) < 0;
                             if (n1) neg128(hi, lo);
                             if (n2) { uint64_t zh = 0; neg128(zh, dd); }
+                            if (hi >= dd) return fault_code(Fault::UnsupportedInstruction); // quotient magnitude >= 2^64: always overflow
                             const uint64_t q = div128u(hi, lo, dd, rem);
+                            if ((n1 != n2) ? (q > 0x8000000000000000ull) : (q > 0x7FFFFFFFFFFFFFFFull)) return fault_code(Fault::UnsupportedInstruction); // signed #DE
                             c.e.r[0] = (n1 != n2) ? (~q + 1) : q;
                             if (n1) rem = ~rem + 1;
                         }
@@ -2376,7 +2368,7 @@ private:
             }
             case 0x05: { // syscall (x64 only): eax = NT syscall number -> native ntdll Nt*
                 if constexpr (is64) {
-                    void* fn = syscallFnFor(static_cast<uint32_t>(c.e.r[0]));
+                    void* fn = syscallFnFor(c.l, static_cast<uint32_t>(c.e.r[0]));
                     if (!fn) return fault_code(Fault::UnsupportedInstruction);
                     uint64_t args[16] = { c.e.r[1], c.e.r[2], c.e.r[8], c.e.r[9], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
                     for (int i = 4; i < 16; ++i) {
@@ -3196,7 +3188,6 @@ private:
                 if (e.ip == kSentinelSub && l.eh.active) {
                     ehResume(l, e);
                     if (l.fault != fault_code(Fault::None)) {
-                        fprintf(stderr, "TRC EHRES fault=%X\n", l.fault); // TEMP batch G
                         return l.fault;
                     }
                     continue;
@@ -3215,16 +3206,12 @@ private:
                 if constexpr (is64) {
                     // x64 MS ABI: caller cleans stack
                     if (!memLd<uint64_t>(e, e.r[kRSP], ret)) {
-                        fprintf(stderr, "TRC STKRSP fail rsp=%llX ip=%llX\n",
-                                (unsigned long long)e.r[kRSP], (unsigned long long)e.ip); // TEMP batch G
                         return fault_code(Fault::OutsideMemory);
                     }
                     e.r[kRSP] += 8; // [rsp+0x28] arg5 at call entry = [rsp+0x20] here
                     uint64_t args[8] = { e.r[1], e.r[2], e.r[8], e.r[9], 0, 0, 0, 0 };
                     for (int i = 4; i < api->nargs && i < 8; ++i) {
                         if (!memLd<uint64_t>(e, e.r[kRSP] + 0x20 + 8 * (i - 4), args[i])) {
-                            fprintf(stderr, "TRC STKARG fail rsp=%llX ip=%llX\n",
-                                    (unsigned long long)e.r[kRSP], (unsigned long long)e.ip); // TEMP batch G
                             return fault_code(Fault::OutsideMemory);
                         }
                     }
@@ -3250,8 +3237,6 @@ private:
                     if constexpr (is64) {
                         e.r[kRSP] -= 8;
                         if (!memSt<uint64_t>(e, e.r[kRSP], ret)) {
-                            fprintf(stderr, "TRC TJPUSH fail rsp=%llX\n",
-                                    (unsigned long long)e.r[kRSP]); // TEMP batch G
                             return fault_code(Fault::OutsideMemory);
                         }
                     }
@@ -3260,7 +3245,6 @@ private:
                     continue;
                 }
                 if (l.fault != fault_code(Fault::None)) {
-                    fprintf(stderr, "TRC APIFLT fault=%X\n", l.fault); // TEMP batch G
                     return l.fault;
                 }
                 if (l.ehThrow.active) {
@@ -3269,7 +3253,6 @@ private:
                     l.ehThrow.active = false;
                     dispatchFrom(l, e, l.ehLogCount);
                     if (l.fault != fault_code(Fault::None)) {
-                        fprintf(stderr, "TRC DISPFLT fault=%X\n", l.fault); // TEMP batch G
                         return l.fault;
                     }
                     continue;
@@ -3279,136 +3262,6 @@ private:
                 continue;
             }
             if (e.budget == 0) return fault_code(Fault::Budget);
-            // TEMP batch G debugging: dump resolved IAT values once at run
-            // start; remove with the rest of the batch G debug prints
-            // TEMP batch G: trampoline/glue watches (ipconfig)
-            {
-                const uint64_t tb = l.env.base() + ST_TRAMP;
-                if (e.ip >= tb && e.ip < tb + 0x21)
-                    fprintf(stderr, "TRC TRAMP ip=+%02llX rax=%llX r10=%llX r11=%llX rsp=%llX\n",
-                            (unsigned long long)(e.ip - tb), (unsigned long long)e.r[0],
-                            (unsigned long long)e.r[10], (unsigned long long)e.r[11],
-                            (unsigned long long)e.r[4]);
-                if (e.ip >= l.img.base() + 0x3120 && e.ip <= l.img.base() + 0x3180)
-                    fprintf(stderr, "TRC WRAP ip=%llX r11=%llX rsp=%llX rax=%llX rbx=%llX\n",
-                            (unsigned long long)e.ip, (unsigned long long)e.r[11],
-                            (unsigned long long)e.r[4], (unsigned long long)e.r[0],
-                            (unsigned long long)e.r[3]);
-                if (e.ip == l.img.base() + 0x3120 || e.ip == l.img.base() + 0x3172) {
-                    uint64_t m0 = 0, m1 = 0, m2 = 0;
-                    memLd<uint64_t>(e, e.r[11], m0);
-                    memLd<uint64_t>(e, e.r[11] + 8, m1);
-                    memLd<uint64_t>(e, e.r[11] - 8, m2);
-                    fprintf(stderr, "TRC WRAPMEM ip=%llX [r11]=%llX [r11+8]=%llX [r11-8]=%llX\n",
-                            (unsigned long long)e.ip, (unsigned long long)m0,
-                            (unsigned long long)m1, (unsigned long long)m2);
-                }
-                {
-                    uint64_t topv = 0;
-                    if (memLd<uint64_t>(e, e.r[4], topv) && topv == 0x100014D44) {
-                        const uint32_t rn = l.ipRingIdx < 24 ? l.ipRingIdx : 24;
-                        fprintf(stderr, "TRC SLOT444 ip=%llX rsp=%llX ring:", (unsigned long long)e.ip,
-                                (unsigned long long)e.r[4]);
-                        for (uint32_t i = 0; i < rn; ++i)
-                            fprintf(stderr, " %llX", (unsigned long long)l.ipRing[(l.ipRingIdx - rn + i) % 32768]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-                if (e.ip >= l.img.base() + 0x3172 && e.ip <= l.img.base() + 0x31A0) {
-                    uint64_t m0 = 0;
-                    memLd<uint64_t>(e, e.r[11], m0);
-                    fprintf(stderr, "TRC WRAP2 ip=%llX rsp=%llX rax=%llX rbx=%llX [r11]=%llX\n",
-                            (unsigned long long)e.ip, (unsigned long long)e.r[4],
-                            (unsigned long long)e.r[0], (unsigned long long)e.r[3],
-                            (unsigned long long)m0);
-                }
-                if (e.ip == l.img.base() + 0x1410)
-                    fprintf(stderr, "TRC GLUE enter rsp=%llX\n", (unsigned long long)e.r[4]);
-                if (e.ip == l.img.base() + 0xBA4C + 0x360) { // TEMP batch G: BA4C entry
-                    fprintf(stderr, "TRC BA4C rcx=%llX r8=%llX r9=%llX rdi=%llX\n",
-                            (unsigned long long)e.r[1], (unsigned long long)e.r[8],
-                            (unsigned long long)e.r[9], (unsigned long long)e.r[7]);
-                    for (int en = 0; en < 11; ++en) {
-                        uint64_t base = e.r[8] + (uint64_t)en * 0x78;
-                        fprintf(stderr, "TRC BA4C e%d:", en);
-                        for (uint64_t off = 0; off < 0x78; off += 8) {
-                            uint64_t v = 0;
-                            memLd<uint64_t>(e, base + off, v);
-                            fprintf(stderr, " %llX", (unsigned long long)v);
-                        }
-                        fprintf(stderr, "\n");
-                    }
-                    for (uint64_t a = 0x43F300; a < 0x43FB00; a += 8) { // TEMP dump string area
-                        uint64_t v = 0;
-                        memLd<uint64_t>(e, a, v);
-                        fprintf(stderr, "TRC BA4C str %llX %016llX\n", (unsigned long long)a, (unsigned long long)v);
-                    }
-                }
-                if (e.ip == l.img.base() + 0x1448)
-                    fprintf(stderr, "TRC GLUE call8578 slotval?\n");
-                // TEMP batch G: whoami fn 0x9278 state watch
-                if ((e.ip >= l.img.base() + 0x9278 + 0x360 && e.ip <= l.img.base() + 0x92A2 + 0x360) ||
-                    (e.ip >= l.img.base() + 0x92CB + 0x360 && e.ip <= l.img.base() + 0x9348 + 0x360)) {
-                    uint64_t g1 = 0, g2 = 0, v9 = 0, caller = 0;
-                    memLd<uint64_t>(e, l.img.base() + 0x148B4 + 0x360, g1);
-                    memLd<uint64_t>(e, l.img.base() + 0x148A8 + 0x360, g2);
-                    if (g2) memLd<uint64_t>(e, g2, v9);
-                    memLd<uint64_t>(e, e.r[4], caller);
-                    if (e.ip == l.img.base() + 0x9278 + 0x360) {
-                        static const uint8_t want[] = {
-                            0x40,0x53,0x48,0x83,0xEC,0x20,0x83,0x3D,0x2F,0xB6,0x00,0x00,0x01,
-                            0x75,0x39,0x48,0x8B,0x0D,0x1A,0xB6,0x00,0x00,0x48,0x85,0xC9,0x74,
-                            0x0F,0x83,0x39,0x09,0x75,0x0A,0xB8,0x01,0x00,0x00,0x00,0xE9,0xD1,
-                            0x00,0x00,0x00,0x48,0xFF,0x15 };
-                        uint8_t got[45] = {};
-                        for (int k = 0; k < 45; ++k) memLd<uint8_t>(e, l.img.base() + 0x9278 + 0x360 + k, got[k]);
-                        bool diff = memcmp(want, got, 45) != 0;
-                        fprintf(stderr, "TRC BYTES9278 diff=%d:", diff);
-                        if (diff) for (int k = 0; k < 45; ++k) fprintf(stderr, " %02X", got[k]);
-                        fprintf(stderr, "\n");
-                    }
-                    fprintf(stderr, "TRC WHO ip=%llX rsp=%llX caller=%llX b4=%llX a8=%llX [a8]=%llX rcx=%llX rax=%llX\n",
-                            (unsigned long long)(e.ip - l.img.base() - 0x360),
-                            (unsigned long long)e.r[4], (unsigned long long)caller,
-                            (unsigned long long)g1, (unsigned long long)g2,
-                            (unsigned long long)v9,
-                            (unsigned long long)e.r[1], (unsigned long long)e.r[0]);
-                }
-            }
-            // TEMP batch G: watch scrt_common_main entries (ipconfig)
-            if (e.ip == l.img.base() + 0x1460) {
-                uint64_t desc[4] = {};
-                for (int k = 0; k < 4; ++k) memLd<uint64_t>(e, e.envBase + 0x1400 + 8 * k, desc[k]);
-                fprintf(stderr, "TRC DESC magic=%llX ib=%llX pdata=%llX psz=%llX\n",
-                        (unsigned long long)desc[0], (unsigned long long)desc[1],
-                        (unsigned long long)desc[2], (unsigned long long)desc[3]);
-            }
-            if (e.ip == l.img.base() + 0x1460)
-                fprintf(stderr, "TRC SCRT enter rsp=%llX ret=%llX\n",
-                        (unsigned long long)e.r[4],
-                        [&]{ uint64_t v = 0; memLd<uint64_t>(e, e.r[4], v); return v; }());
-            // TEMP batch G: watch the _initterm jmp site (ipconfig rva 0x1933)
-            if (e.ip == l.img.base() + 0x1C53) {
-                uint64_t initterm = 0, wga = 0, t0 = 0, t1 = 0;
-                memLd<uint64_t>(e, l.img.base() + 0x8868, initterm);
-                memLd<uint64_t>(e, l.img.base() + 0x8898, wga);
-                memLd<uint64_t>(e, l.img.base() + 0x8970, t0);
-                memLd<uint64_t>(e, l.img.base() + 0x8978, t1);
-                uint8_t stub0[16] = {}, stub1[16] = {};
-                for (int k = 0; k < 16; ++k) {
-                    memLd<uint8_t>(e, initterm + k, stub0[k]);
-                    memLd<uint8_t>(e, wga + k, stub1[k]);
-                }
-                fprintf(stderr, "TRC WATCH1933 initterm8548=%llX wga8578=%llX tbl[0]=%llX tbl[1]=%llX rcx=%llX rdx=%llX\n",
-                        (unsigned long long)initterm, (unsigned long long)wga,
-                        (unsigned long long)t0, (unsigned long long)t1,
-                        (unsigned long long)e.r[1], (unsigned long long)e.r[2]);
-                fprintf(stderr, "  stub@initterm:");
-                for (int k = 0; k < 16; ++k) fprintf(stderr, " %02X", stub0[k]);
-                fprintf(stderr, "\n  stub@wga     :");
-                for (int k = 0; k < 16; ++k) fprintf(stderr, " %02X", stub1[k]);
-                fprintf(stderr, "\n");
-            }
             // batch D: call/jmp into a whitelisted real system module runs a
             // native bridge (esp/rsp adjusted as the real callee cleans);
             // anything else stays fail-closed fetch-outside-image.
@@ -3420,8 +3273,6 @@ private:
                     uint64_t ret = 0;
                     if constexpr (is64) {
                         if (!memLd<uint64_t>(e, e.r[kRSP], ret)) {
-                            fprintf(stderr, "TRC NATRSP fail rsp=%llX ip=%llX\n",
-                                    (unsigned long long)e.r[kRSP], (unsigned long long)e.ip); // TEMP batch G
                             return fault_code(Fault::OutsideMemory);
                         }
                         e.r[kRSP] += 8;
@@ -3431,18 +3282,7 @@ private:
                             if (memLd<uint64_t>(e, e.r[kRSP] + 0x20 + 8 * (i - 4), v)) args[i] = v;
                         }
                         uint64_t out = 0;
-                        fprintf(stderr, "TRC NAT fn=");
-                        for (uint32_t mi = 0; mi < l.realModCount; ++mi)
-                            if (e.ip >= l.realMods[mi].base && e.ip < l.realMods[mi].end)
-                                fprintf(stderr, "%s+%llX ", kNativeModuleNames[mi],
-                                        (unsigned long long)(e.ip - l.realMods[mi].base));
-                        fprintf(stderr, "=%llX ret=%llX rcx=%llX rdx=%llX r8=%llX r9=%llX\n",
-                                (unsigned long long)e.ip, (unsigned long long)ret,
-                                (unsigned long long)args[0],
-                                (unsigned long long)args[1], (unsigned long long)args[2],
-                                (unsigned long long)args[3]);
                         if (!callNativeWin64(e.ip, args, out)) return fault_code(Fault::NativeFault);
-                        fprintf(stderr, "TRC NATR out=%llX\n", (unsigned long long)out); // TEMP batch G
                         e.r[0] = out;
                     } else {
                         uint32_t args[16] = {};
@@ -3464,67 +3304,25 @@ private:
                     e.ip = ret;
                     continue;
                 }
-                if (e.ip == 0 || e.ip == l.img.base()) {
-                    // TEMP batch G: IAT zero dump for unresolved slots
-                    fprintf(stderr, "TRC IAT0:");
-                    for (uint32_t rva = 0x4150; rva <= 0x4230; rva += 8) {
-                        uint64_t v = 0;
-                        memLd<uint64_t>(e, l.img.base() + 0x320 + rva, v);
-                        fprintf(stderr, " %X:%llX", rva, (unsigned long long)v);
-                    }
-                    fprintf(stderr, "\n");
-                }
                 fprintf(stderr, "instruction fetch outside image: ip=0x%llX (off=0x%llX)\n",
                         (unsigned long long)e.ip,
                         (unsigned long long)(e.ip - l.img.base()));
-                if (l.ipRing) {
-                    const uint32_t n = l.ipRingIdx < 40 ? l.ipRingIdx : 40;
-                    fprintf(stderr, "TRC FAULTRING[%u]:", static_cast<unsigned>(n));
-                    for (uint32_t i = 0; i < n; ++i)
-                        fprintf(stderr, " %llX",
-                                (unsigned long long)l.ipRing[(l.ipRingIdx - n + i) % 32768]);
-                    fprintf(stderr, "\n");
-                }
-                uint64_t retV = 0, r0v = 0, r8v = 0, r9v = 0, r2v = 0, r3v = 0, r1v = 0, r6v = 0;
-                memLd<uint64_t>(e, e.r[kRSP], retV);
-                fprintf(stderr, "TRC: base=%llX imgEnd=%llX rsp=%llX[rsp]=%llX ip=%llX rax=%llX rcx=%llX rdx=%llX r8=%llX r9=%llX rbx=%llX rbp=%llX r10=%llX r11=%llX r12=%llX r13=%llX r14=%llX r15=%llX fs0=%llX\n",
-                        (unsigned long long)l.img.base(), (unsigned long long)e.imgEnd, (unsigned long long)e.r[kRSP], (unsigned long long)retV,
-                        (unsigned long long)e.ip,
-                        (unsigned long long)e.r[0], (unsigned long long)e.r[2], (unsigned long long)e.r[3],
-                        (unsigned long long)e.r[8], (unsigned long long)e.r[9], (unsigned long long)e.r[6],
-                        (unsigned long long)e.r[7], (unsigned long long)e.r[10], (unsigned long long)e.r[11],
-                        (unsigned long long)e.r[12], (unsigned long long)e.r[13], (unsigned long long)e.r[14],
-                        (unsigned long long)e.r[15], (unsigned long long)e.gsBase);
                 return fault_code(Fault::OutsideMemory);
             }
             --e.budget;
-            {
-                static uint64_t traceRing[32768];
-                static uint32_t traceIdx = 0;
-                traceRing[traceIdx % 32768] = e.ip;
-                ++traceIdx;
-                l.ipRing = traceRing;
-                l.ipRingIdx = traceIdx;
-            }
             Fetch f = inTramp
                 ? Fetch{l.env.data() + ST_TRAMP, 0x28, static_cast<size_t>(e.ip - trampBase), trampBase}
-                : Fetch{l.img.data(), l.img.size(), static_cast<size_t>(e.ip - l.img.base()), l.img.base()};
+                : Fetch{l.img.data(), static_cast<size_t>(l.img.size()), static_cast<size_t>(e.ip - l.img.base()), l.img.base()};
             Ctx c{e, l, f};
-            const uint32_t r = stepOne(c);
+            uint32_t r = stepOne(c);
+            if (r == fault_code(Fault::None) && c.f.fault != fault_code(Fault::None))
+                r = c.f.fault; // fetch past image end: same fetch-outside-image fault
             if (r != fault_code(Fault::None)) {
                 if (r == fault_code(Fault::Halt)) break; // stub chain end: exit code = EAX
                 if (r == fault_code(Fault::OutsideMemory)) {
                     fprintf(stderr, "fault: access outside emulated memory at ip=0x%llX (off=0x%llX)\n",
                             static_cast<unsigned long long>(e.ip),
                             static_cast<unsigned long long>(e.ip - l.img.base()));
-                    if (l.ipRing) {
-                        const uint32_t n = l.ipRingIdx < 32768 ? l.ipRingIdx : 32768;
-                        fprintf(stderr, "TRC ring[%u]:", static_cast<unsigned>(n));
-                        for (uint32_t i = 0; i < n; ++i)
-                            fprintf(stderr, " %llX",
-                                    (unsigned long long)l.ipRing[(l.ipRingIdx - n + i) % 32768]);
-                        fprintf(stderr, "\n");
-                    }
                 }
                 if (r == fault_code(Fault::UnsupportedInstruction)) {
                     fprintf(stderr, "fault: unimplemented opcode at ip=0x%llX (off=0x%llX)\n",
@@ -3593,7 +3391,10 @@ public:
         e.ip = t.entry;
 
         const uint32_t r = runLoop(e);
-        if (r != fault_code(Fault::None)) return r;
+        // Halt ends a thread the same way it ends main: exit code = EAX
+        // (ExitThread stand-in rides the halt; the join/wait stand-in
+        // records this as the thread's exitCode)
+        if (r != fault_code(Fault::None) && r != fault_code(Fault::Halt)) return r;
         return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
     }
 };

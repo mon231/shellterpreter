@@ -8,18 +8,21 @@ namespace stub {
 
 // ---- module registry -------------------------------------------------
 
-const char* const kNativeModuleNames[19] = {
+const char* const kNativeModuleNames[24] = {
     "kernel32.dll", "kernelbase.dll", "ntdll.dll",
     "user32.dll", "gdi32.dll", "advapi32.dll",
     "iphlpapi.dll", "ws2_32.dll", "dnsapi.dll",
     "nsi.dll", "dhcpcsvc.dll", "dhcpcsvc6.dll",
     "msvcrt.dll", "mswsock.dll",
     "version.dll", "authz.dll", "sspicli.dll", "wkscli.dll", "netutils.dll",
+    // batch H task 5b: winsock catalog providers — real WSAStartup loads them
+    // late (after the exec-audit snapshot); preload so no new exec pages appear
+    "winrnr.dll", "wshbth.dll", "napinsp.dll", "nlansp_c.dll", "wshtcpip.dll",
 };
 
 static void registerModules(Loaded& l) {
-    for (uint32_t i = 0; i < 19; ++i) {
-        if (l.realModCount >= 24) break;
+    for (uint32_t i = 0; i < 24; ++i) {
+        if (l.realModCount >= 32) break;
         const char* name = kNativeModuleNames[i];
         HMODULE h = GetModuleHandleA(name);
         if (!h) h = LoadLibraryA(name);
@@ -31,8 +34,6 @@ static void registerModules(Loaded& l) {
         const auto base = reinterpret_cast<uint64_t>(h);
         if (mi.SizeOfImage < 0x1000 || mi.SizeOfImage > 0x10000000) continue;
         l.realMods[l.realModCount] = ModuleRange{ base, base + mi.SizeOfImage };
-        fprintf(stderr, "TRC REG [%u]=%s base=%llX end=%llX\n", l.realModCount, name,
-                (unsigned long long)base, (unsigned long long)(base + mi.SizeOfImage));
         ++l.realModCount;
     }
 }
@@ -45,19 +46,16 @@ bool isNativeModuleAddr(const Loaded& l, uint64_t addr) {
 
 // ---- syscall table (x64 host): scan ntdll Nt* stub prologues ----------
 
-struct SysEntry { uint32_t num; void* fn; };
-static SysEntry gSys[2048];
-static uint32_t gSysCount = 0;
-
 bool isX64Host() { return sizeof(void*) == 8; }
 
-void* syscallFnFor(uint32_t sysno) {
-    for (uint32_t i = 0; i < gSysCount; ++i)
-        if (gSys[i].num == sysno) return gSys[i].fn;
+void* syscallFnFor(const Loaded& l, uint32_t sysno) {
+    for (uint32_t i = 0; i < l.sysCount; ++i)
+        if (l.sysNum[i] == sysno) return l.sysFn[i];
     return nullptr;
 }
 
-static void buildSyscallTable() {
+static void buildSyscallTable(Loaded& l) {
+    l.sysCount = 0; // every run rebuilds from scratch
     HMODULE nt = GetModuleHandleA("ntdll.dll");
     if (!nt) return;
     const auto base = reinterpret_cast<uint64_t>(nt);
@@ -74,21 +72,22 @@ static void buildSyscallTable() {
     const uint32_t funcsRva = *reinterpret_cast<const uint32_t*>(exp + 0x1C);
     const auto names = reinterpret_cast<const uint32_t*>(base + namesRva);
     const auto funcs = reinterpret_cast<const uint32_t*>(base + funcsRva);
-    for (uint32_t i = 0; i < nameCount && gSysCount < 2048; ++i) {
+    for (uint32_t i = 0; i < nameCount && l.sysCount < 2048; ++i) {
         const char* nm = reinterpret_cast<const char*>(base + names[i]);
         if (nm[0] != 'N' || nm[1] != 't') continue;
         const uint8_t* code = reinterpret_cast<const uint8_t*>(base + funcs[i]);
         // standard stub: 4C 8B D1 (mov r10, rcx) ; B8 imm32 (mov eax, num)
-        if (code[0] == 0x4C && code[1] == 0x8B && code[2] == 0xD1 && code[3] == 0xB8)
-            gSys[gSysCount++] = SysEntry{
-                *reinterpret_cast<const uint32_t*>(code + 4),
-                reinterpret_cast<void*>(base + funcs[i]) };
+        if (code[0] == 0x4C && code[1] == 0x8B && code[2] == 0xD1 && code[3] == 0xB8) {
+            l.sysNum[l.sysCount] = *reinterpret_cast<const uint32_t*>(code + 4);
+            l.sysFn[l.sysCount] = reinterpret_cast<void*>(base + funcs[i]);
+            ++l.sysCount;
+        }
     }
 }
 
 void initNativeBridge(Loaded& l) {
     registerModules(l);
-    if (sizeof(void*) == 8) buildSyscallTable();
+    if (sizeof(void*) == 8) buildSyscallTable(l);
 }
 
 // ---- bridges ----------------------------------------------------------

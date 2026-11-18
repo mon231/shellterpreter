@@ -41,14 +41,6 @@ static bool startsWithNoCase(const char* s, const char* prefix) {
 static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
     char name[64];
     if (!guestStr(l, args[0], name)) return 0;
-    fprintf(stderr, "TRC LDA name=%s", name);
-    // TEMP batch G: log whitelist resolution result
-    for (uint32_t i = 0; i < l.realModCount; ++i)
-        if (nameEq(name, kNativeModuleNames[i])) {
-            fprintf(stderr, " -> realMods[%u]=%llX", i, (unsigned long long)l.realMods[i].base);
-            break;
-        }
-    fprintf(stderr, "\n");
     // batch D: whitelisted system modules now resolve to their real base;
     // calls into them go through the native bridge, everything else keeps
     // the interpreter's fake module layout
@@ -69,7 +61,6 @@ static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
         startsWithNoCase(name, "api-ms-win-shcore-") ||
         startsWithNoCase(name, "api-ms-win-security-") ||
         startsWithNoCase(name, "api-ms-win-service-")) return l.realKbase();
-    return 0;
     // the CRT is split over ucrtbase/msvcp140/vcruntime140 and api-set stubs,
     // with a "d" suffix in Debug builds (msvcp140d, ucrtbased, ...)
     if (startsWithNoCase(name, "ucrtbase") || startsWithNoCase(name, "ucrtbased") ||
@@ -82,14 +73,6 @@ static uint64_t apiLoadLibraryA(Loaded& l, const uint64_t* args) {
 }
 
 static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
-    { // TEMP batch G
-        char tname[64];
-        if (guestStr(l, args[1], tname))
-            fprintf(stderr, "TRC GP mod=%llX name=%s\n",
-                    (unsigned long long)args[0], tname);
-        else
-            fprintf(stderr, "TRC GP mod=%llX name=?\n", (unsigned long long)args[0]);
-    }
     if (args[1] < kOrdinalMax) {
         // ordinal imports carry no name; only resolvable against a real module
         for (uint32_t i = 0; i < l.realModCount; ++i) {
@@ -114,8 +97,23 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     if (nameEq(name, "_Thrd_id"))       return l.env.base() + ST_THRDID;
     if (nameEq(name, "GetCurrentThreadId")) return l.env.base() + ST_THRDID;
     if (nameEq(name, "_Cnd_do_broadcast_at_thread_exit")) return l.env.base() + ST_CNDEXIT;
+    // thread lifecycle (kernel32): WaitForSingleObject/ExitThread intercept
+    // before the real-module fallback so a native wait/exit never runs
+    // against an emulated thread handle; Sleep is also shadowed (timed waits
+    // are no-ops by design, no-timing emulation)
+    if (nameEq(name, "WaitForSingleObject")) return l.env.base() + ST_W4SO;
+    if (nameEq(name, "ExitThread"))          return l.env.base() + ST_EXITTHREAD;
+    if (nameEq(name, "GetCurrentThread"))    return l.env.base() + ST_GCTHREAD;
+    if (nameEq(name, "Sleep"))               return l.env.base() + ST_SLEEP;
     if (nameEq(name, "malloc"))         return l.env.base() + ST_MALLOC;
     if (nameEq(name, "free"))           return l.env.base() + ST_FREE;
+    // scalar operator delete must share the free stand-in's heap identity:
+    // the real msvcrt implementation frees on msvcrt's private CRT heap
+    // (_crtheap), but heapAlloc hands out GetProcessHeap blocks — freeing a
+    // foreign pointer there corrupts that heap (whoami teardown, batch H
+    // task 5b). x64 and x86 mangled names.
+    if (nameEq(name, "??3@YAXPEAX@Z") || nameEq(name, "??3@YAXPAX@Z"))
+        return l.env.base() + ST_FREE;
     if (nameEq(name, "_callnewh"))      return l.env.base() + ST_CALLNEWH;
     // throw helpers: the stand-ins record the throw and the interpreter walks
     // the guest frames itself (see dispatchThrow in cpu.hpp)
@@ -159,6 +157,14 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     // natively (guest pages are not executable); halt the run instead
     if (nameEq(name, "exit") || nameEq(name, "_exit") || nameEq(name, "_amsg_exit"))
         return l.env.base() + ST_EXIT;
+    // atexit-family registration must be intercepted BEFORE the real-module
+    // fallback: the real msvcrt functions record guest addresses in their own
+    // atexit table, and native doexit later calls them into freed guest
+    // memory (whoami shutdown, batch H task 6b). Registration is an emulated
+    // no-op: guest static destructors do not run.
+    if (nameEq(name, "atexit"))      return l.env.base() + ST_ATEXIT;
+    if (nameEq(name, "_onexit"))     return l.env.base() + ST_ONEXIT;
+    if (nameEq(name, "__dllonexit")) return l.env.base() + ST_DLLONEXIT;
     // frees guest-heap pointers handed out by FormatMessageW; the native
     // LocalFree would see a bogus host handle
     if (nameEq(name, "LocalFree")) return l.env.base() + ST_SLIST;
@@ -182,7 +188,6 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     for (uint32_t i = 0; i < l.realModCount; ++i) {
         if (args[0] != l.realMods[i].base) continue;
         const FARPROC p = ::GetProcAddress(reinterpret_cast<HMODULE>(args[0]), name);
-        if (!p) fprintf(stderr, "TRC GPA0 mod=%s name=%s\n", kNativeModuleNames[i], name);
         return reinterpret_cast<uint64_t>(p);
     }
     // mem* through guest-blob stand-ins only when no real module supplied
@@ -190,7 +195,6 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
     // address, and guest pointers are identity-mapped so native mem* is safe
     if (nameEq(name, "memcpy")) return l.env.base() + ST_MEMCPY;
     if (nameEq(name, "memset")) return l.env.base() + ST_MEMSET;
-    fprintf(stderr, "TRC GPA nomatch mod=%llX name=%s\n", (unsigned long long)args[0], name);
     return 0;
 }
 
@@ -221,28 +225,6 @@ static uint64_t apiNoOp(Loaded&, const uint64_t*) { return 0; }
 // scratch and tail-jumps into it; the loop calls every non-null entry and its
 // final ret lands on the stand-in caller's return address
 static uint64_t apiInitterm(Loaded& l, const uint64_t* args) {
-    fprintf(stderr, "TRC INITERM enter rcx=%llX rdx=%llX\n",
-            (unsigned long long)args[0], (unsigned long long)args[1]);
-    {
-        // TEMP batch G: early IAT dump (WSAStartup slot check)
-        fprintf(stderr, "TRC IAT0E:");
-        for (uint32_t rva = 0x4150; rva <= 0x4230; rva += 8) {
-            GuestMem m = guestMem(l, l.img.base() + 0x320 + rva);
-            uint64_t v = 0;
-            if (m.p && m.avail >= 8) memcpy(&v, m.p, 8);
-            fprintf(stderr, " %X:%llX", rva, (unsigned long long)v);
-        }
-        fprintf(stderr, "\n");
-        // TEMP batch G: whoami IAT range
-        fprintf(stderr, "TRC IATW:");
-        for (uint32_t rva = 0x10D00; rva <= 0x11010; rva += 8) {
-            GuestMem m = guestMem(l, l.img.base() + 0x320 + rva);
-            uint64_t v = 0;
-            if (m.p && m.avail >= 8) memcpy(&v, m.p, 8);
-            fprintf(stderr, " %X:%llX", rva, (unsigned long long)v);
-        }
-        fprintf(stderr, "\n");
-    }
     if (sizeof(void*) != 8) return 0; // 32-bit guests keep the no-op stand-in
     static const uint8_t tramp[] = {
         0x4C, 0x8B, 0xD1,             // 00 mov r10, rcx
@@ -279,9 +261,6 @@ static uint64_t apiMemcpy(Loaded& l, const uint64_t* args) {
     GuestMem dst = guestMem(l, args[0]);
     GuestMem src = guestMem(l, args[1]);
     if (!dst.p || dst.avail < n || !src.p || src.avail < n) {
-        fprintf(stderr, "TRC MCOPY fail dst=%llX src=%llX n=%llX\n",
-                (unsigned long long)args[0], (unsigned long long)args[1],
-                (unsigned long long)args[2]); // TEMP batch G
         l.fault = fault_code(Fault::OutsideMemory);
         return 0;
     }
@@ -294,8 +273,6 @@ static uint64_t apiMemset(Loaded& l, const uint64_t* args) {
     if (!n) return args[0];
     GuestMem dst = guestMem(l, args[0]);
     if (!dst.p || dst.avail < n) {
-        fprintf(stderr, "TRC MSET fail dst=%llX n=%llX\n",
-                (unsigned long long)args[0], (unsigned long long)args[2]); // TEMP batch G
         l.fault = fault_code(Fault::OutsideMemory);
         return 0;
     }
@@ -314,17 +291,23 @@ static uint64_t apiExit(Loaded& l, const uint64_t* args) {
     return args[0];
 }
 
-// rand/srand: classic MSVCRT LCG, shared static seed
-static uint64_t gRandSeed = 0;
+// atexit/__dllonexit/_onexit: registration is an emulated no-op (guest
+// callbacks must never be recorded for a native doexit walk into freed guest
+// memory, batch H task 6b); _onexit and __dllonexit return their argument,
+// the documented success shape (pointer to the registered function)
+static uint64_t apiAtexit(Loaded&, const uint64_t*) { return 0; }
+static uint64_t apiOnexit(Loaded&, const uint64_t* args) { return args[0]; }
 
-static uint64_t apiSrand(Loaded&, const uint64_t* args) {
-    gRandSeed = args[0] & 0xFFFFFFFFull;
+// rand/srand: classic MSVCRT LCG; seed is per-run Loaded state
+// (was file-static gRandSeed)
+static uint64_t apiSrand(Loaded& l, const uint64_t* args) {
+    l.randSeed = args[0] & 0xFFFFFFFFull;
     return 0;
 }
 
-static uint64_t apiRand(Loaded&, const uint64_t*) {
-    gRandSeed = gRandSeed * 214013ull + 2531011ull;
-    return (gRandSeed >> 16) & 0x7FFF;
+static uint64_t apiRand(Loaded& l, const uint64_t*) {
+    l.randSeed = l.randSeed * 214013ull + 2531011ull;
+    return (l.randSeed >> 16) & 0x7FFF;
 }
 
 // minimal printf: %d %i %u %x %X %c %s %%. Buffered so an unsupported
@@ -337,12 +320,12 @@ static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
     int argIdx = 1;
     for (const char* p = fmt; *p; ++p) {
         if (*p != '%') {
-            if (n < sizeof(out)) out[n++] = *p;
+            if (n < sizeof(out) - 1) out[n++] = *p;
             continue;
         }
         const char spec = *++p;
         if (spec == '%') {
-            if (n < sizeof(out)) out[n++] = '%';
+            if (n < sizeof(out) - 1) out[n++] = '%';
             continue;
         }
         // arguments at our call sites are 32-bit values; all guest pointers
@@ -414,6 +397,7 @@ static bool resFind(const Loaded& l, uint64_t imageBase, uint32_t resRva, uint32
                 const uint32_t nr = resRva + (e[0] & 0x7FFFFFFFu);
                 uint16_t len = 0;
                 if (!imgRead(l, imageBase, nr, &len, 2)) continue;
+                if (len > 63) len = 63; // guest u16 length: name is char[64], stay in bounds
                 bool eq = name[len] == '\0';
                 for (uint16_t k = 0; k < len && eq; ++k) {
                     uint16_t c = 0;
@@ -526,9 +510,6 @@ static bool moduleFileNameSelf(Loaded& l, uint64_t h) {
 static uint64_t apiModuleFileNameW(Loaded& l, const uint64_t* args) {
     wchar_t path[300];
     uint64_t chars;
-    fprintf(stderr, "TRC MODFNW h=%llX buf=%llX cap=%llX name=%s\n",
-            (unsigned long long)args[0], (unsigned long long)args[1],
-            (unsigned long long)args[2], l.name); // TEMP batch G
     if (moduleFileNameSelf(l, args[0])) {
         if (!l.name[0]) return 0; // unnamed blob: fail closed
         chars = swprintf(path, 300, L"C:\\Windows\\System32\\%hs.exe", l.name);
@@ -604,7 +585,7 @@ static uint64_t muiFallback(Loaded& l, uint64_t flags, uint64_t msgId,
     va_list ap = nullptr;
     if (vaArgs) {
         GuestMem mv = guestMem(l, vaArgs);
-        if (mv.p && mv.avail >= 8) memcpy(&ap, mv.p, 8);
+        if (mv.p && mv.avail >= sizeof(va_list)) memcpy(&ap, mv.p, sizeof(va_list));
     }
     const DWORD n = ::FormatMessageW(
         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_HMODULE |
@@ -630,11 +611,6 @@ static uint64_t muiFallback(Loaded& l, uint64_t flags, uint64_t msgId,
 }
 
 static uint64_t apiFormatMessageW(Loaded& l, const uint64_t* args) {
-    fprintf(stderr, "TRC FMT flags=%llX src=%llX msgid=%llX lang=%llX buf=%llX n=%llX va=%llX\n",
-            (unsigned long long)args[0], (unsigned long long)args[1],
-            (unsigned long long)args[2], (unsigned long long)args[3],
-            (unsigned long long)args[4], (unsigned long long)args[5],
-            (unsigned long long)args[6]);
     const uint64_t flags = args[0], src = args[1], msgId = args[2];
     const uint64_t bufferPtr = args[4], nSize = args[5], vaArgs = args[6];
     constexpr uint64_t kAllocate = 0x100, kFromString = 0x400, kFromHmodule = 0x800;
@@ -736,9 +712,16 @@ static uint64_t apiFormatMessageW(Loaded& l, const uint64_t* args) {
             if (r < mlen) { spec = msg[q + 1]; q = r + 1; }
         }
         uint64_t val = 0;
+        // Arguments is va_list* (same convention muiFallback derefs, verified
+        // against real MSVC blobs): insert N lives at *Arguments + 8*(N-1)
         if (!(flags & kIgnoreInserts) && vaArgs) {
-            GuestMem m = guestMem(l, vaArgs + 8 * (num - 1));
-            if (m.p && m.avail >= 8) memcpy(&val, m.p, 8);
+            uint64_t apBase = 0;
+            GuestMem ma = guestMem(l, vaArgs);
+            if (ma.p && ma.avail >= 8) memcpy(&apBase, ma.p, 8);
+            if (apBase) {
+                GuestMem m = guestMem(l, apBase + 8 * (num - 1));
+                if (m.p && m.avail >= 8) memcpy(&val, m.p, 8);
+            }
         }
         if (spec == L's' || spec == L'S') {
             if (val) {
@@ -844,14 +827,72 @@ static uint64_t apiThrdId(Loaded&, const uint64_t*) {
     return 1; // main thread id
 }
 
+// WaitForSingleObject(handle, ms): emulated thread handles take the
+// join-driven path, mirrors _Thrd_join — the wait runs the pending thread's
+// entry on its own stack (no host threads, no blocking). ms is ignored on
+// that path (single-threaded emulation, timing not modeled). Pseudo-handles
+// (-1/-2) short-circuit to WAIT_FAILED (a native wait on -2 would hang).
+// Any other handle is a real kernel handle from a native call: forward to
+// the real WaitForSingleObject (same direct host-call pattern as heapAlloc).
+// x86 note: the guest keeps 32-bit handles, so the value is zero-extended;
+// truncation of 64-bit handles is a pre-existing x86 bridge caveat.
+static uint64_t apiWaitForSingleObject(Loaded& l, const uint64_t* args) {
+    ThreadContext* tc = nullptr;
+    for (uint32_t i = 0; i < l.threadCount; ++i)
+        if (l.threads[i].handle == args[0]) { tc = &l.threads[i]; break; }
+    if (tc) {
+        if (!tc->done) {
+            const uint32_t rc = runThread(l, *tc);
+            tc->exitCode = rc;
+            tc->done = true;
+        }
+        return 0; // WAIT_OBJECT_0
+    }
+    if (args[0] == 0xFFFFFFFFFFFFFFFFull || args[0] == 0xFFFFFFFFFFFFFFFEull)
+        return 0xFFFFFFFFull; // WAIT_FAILED
+    return static_cast<uint64_t>(::WaitForSingleObject(
+        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(args[0])),
+        static_cast<DWORD>(args[1])));
+}
+
+// ExitThread(code): halts the running guest execution; on the main
+// execution context it halts the whole run (same as apiExit). There is no
+// active-thread state (runThread's ThreadContext is local to the join/wait
+// stand-in), so the exit code rides the halt like apiExit and the
+// join/wait stand-in records it in the thread's ThreadContext after
+// runThread returns (runThread treats Halt like runMain: exit code = EAX).
+static uint64_t apiExitThread(Loaded& l, const uint64_t* args) {
+    l.fault = fault_code(Fault::Halt);
+    return args[0];
+}
+
+// pseudo thread handle, (HANDLE)-2
+static uint64_t apiGetCurrentThread(Loaded&, const uint64_t*) { return 0xFFFFFFFFFFFFFFFEull; }
+
+// no host sleep (single-threaded emulation, timing not modeled)
+static uint64_t apiSleep(Loaded&, const uint64_t*) { return 0; }
+
 // stand-ins that hand out data (#argv/env) allocate from the real process
 // heap, not the bump-heap: the guest frees these with the native free /
 // operator delete (imports resolve natively), which only accepts native heap
 // blocks; guest reads/writes on the returned host pointers go through the
-// host-page fallback in memLd/memSt
+// host-page fallback in memLd/memSt. x86 guests keep the bump-heap: a native
+// HeapAlloc pointer is >4 GiB and truncates to 32 bits in the guest.
 static uint64_t heapAlloc(Loaded& l, uint64_t sz) {
-    void* p = HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(sz));
-    return reinterpret_cast<uint64_t>(p);
+    // x64 guest: native block stays freeable by native operator delete (real
+    // binaries, whoami teardown)
+    if (l.is64) {
+        void* p = HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(sz));
+        return reinterpret_cast<uint64_t>(p);
+    }
+    // x86 guest: bump-allocate from the guest heap, below 4 GiB
+    const uint64_t align = 16;
+    const uint64_t base = l.heapNext;
+    const uint64_t aligned = (base + align - 1) & ~(align - 1);
+    const uint64_t end = aligned + sz;
+    if (end > l.heapEnd) return 0;
+    l.heapNext = end;
+    return aligned;
 }
 
 static uint64_t apiCndExit(Loaded&, const uint64_t*) { return 0; }
@@ -862,7 +903,20 @@ static uint64_t apiMalloc(Loaded& l, const uint64_t* args) {
     return heapAlloc(l, sz);
 }
 
-static uint64_t apiFree(Loaded&, const uint64_t*) { return 0; }
+static uint64_t apiFree(Loaded& l, const uint64_t* args) {
+    // delete resolves natively, but the guest may free a non-native-heap
+    // pointer (guest bump-heap, garbage): HeapValidate answers false and we
+    // ignore the free harmlessly instead of crashing
+    void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(args[0]));
+    // bump-heap blocks are owned by the guest allocator: a guest address can
+    // alias a live native heap block, so never reach HeapValidate/HeapFree
+    // with it
+    const bool bump = p && args[0] >= l.heap.base() &&
+                      args[0] - l.heap.base() < l.heap.size();
+    if (bump) return 0;
+    if (p && HeapValidate(GetProcessHeap(), 0, p)) HeapFree(GetProcessHeap(), 0, p);
+    return 0;
+}
 
 static uint64_t apiCallNewh(Loaded&, const uint64_t*) { return 0; } // no new-handler
 
@@ -928,9 +982,6 @@ static uint64_t heapStoreString(Loaded& l, const char* text, bool wide) {
 // *(Argc)=1, *(Argv) = [name, NULL], *(Env) = [NULL] on the guest heap.
 template <class Char>
 static uint64_t apiGetMainArgsImpl(Loaded& l, const uint64_t* args) {
-    fprintf(stderr, "TRC WGAENTER args=%llX,%llX,%llX,%llX\n",
-            (unsigned long long)args[0], (unsigned long long)args[1],
-            (unsigned long long)args[2], (unsigned long long)args[3]);
     constexpr bool wide = ArgvEncoding<Char>::kWide;
     const uint64_t nameAddr = heapStoreString(l, l.name[0] ? l.name : "ipconfig", wide);
     const uint64_t argvArray = heapAlloc(l, 2 * sizeof(uint64_t));
@@ -947,16 +998,6 @@ static uint64_t apiGetMainArgsImpl(Loaded& l, const uint64_t* args) {
     GUEST_WRITE(l, args[2], &envArray, sizeof(uint64_t));
     GUEST_WRITE(l, argvArray, argvArrayEntry, sizeof(argvArrayEntry));
     GUEST_WRITE(l, envArray, &envNullTerminator, sizeof(uint64_t));
-    fprintf(stderr, "TRC WGA args=%llX,%llX,%llX,%llX argv=%llX name=%llX\n",
-            (unsigned long long)args[0], (unsigned long long)args[1],
-            (unsigned long long)args[2], (unsigned long long)args[3],
-            (unsigned long long)argvArray, (unsigned long long)nameAddr);
-    uint32_t argcBack = 0xFFFFFFFF; uint64_t argvBack = 0;
-    if (auto gm = guestMem(l, args[0]); gm.p && gm.avail >= 4)
-        memcpy(&argcBack, gm.p, 4);
-    if (auto gm = guestMem(l, args[1]); gm.p && gm.avail >= 8)
-        memcpy(&argvBack, gm.p, 8);
-    fprintf(stderr, "TRC WGA back argc=%u argvptr=%llX\n", argcBack, (unsigned long long)argvBack);
     return 0;
 }
 
@@ -983,6 +1024,10 @@ void registerApiStandins(Loaded& l) {
         { B + ST_SIZE_RES_A, 2, false, apiSizeofResource },
         { B + ST_BEGINT,   6, true, apiBeginThread },
         { B + ST_THRDJOIN, 3, true, apiThrdJoin },
+        { B + ST_W4SO,       2, false, apiWaitForSingleObject },
+        { B + ST_EXITTHREAD, 1, false, apiExitThread },
+        { B + ST_GCTHREAD,   0, false, apiGetCurrentThread },
+        { B + ST_SLEEP,      1, false, apiSleep },
         { B + ST_THRDID,   0, true, apiThrdId },
         { B + ST_CNDEXIT,  0, true, apiCndExit },
         { B + ST_MALLOC,   1, true, apiMalloc },
@@ -1014,6 +1059,9 @@ void registerApiStandins(Loaded& l) {
         { B + ST_MODH,     1, false, apiModuleHandle },
         { B + ST_FMT,      7, false, apiFormatMessageW },
         { B + ST_EXIT,     1, false, apiExit },
+        { B + ST_ATEXIT,   1, true,  apiAtexit },
+        { B + ST_ONEXIT,   1, true,  apiOnexit },
+        { B + ST_DLLONEXIT, 3, true, apiOnexit },
         { B + ST_MODFNW,   3, false, apiModuleFileNameW },
         { B + ST_MODFNA,   3, false, apiModuleFileNameA },
     };

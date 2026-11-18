@@ -17,6 +17,8 @@ namespace stub {
 //   0x1D20 rand stand-in                  0x1E00 fake msvcrt module handle (no image)
 //   0x1D30 FindResourceA stand-in         0x1D40 SizeofResource stand-in
 //   0x1D50 _beginthreadex stand-in        0x1D60 _Thrd_join stand-in
+//   0x1E58 WaitForSingleObject stand-in   0x1E60 ExitThread stand-in
+//   0x1E68 GetCurrentThread stand-in      0x1E70 Sleep stand-in
 //   0x1D70 _Thrd_id stand-in              0x1D80 _Cnd_do_broadcast_at_thread_exit
 //   0x1D90 malloc stand-in                0x1DA0 free stand-in
 //   0x1DB0 _callnewh stand-in             0x1DC0 fail-closed CRT helper
@@ -47,7 +49,9 @@ constexpr uint32_t ST_CSH      = 0x1DD0; // __C_specific_handler stub
 constexpr uint32_t ST_MEMCPY   = 0x1DE0;
 constexpr uint32_t ST_CNOP     = 0x1DF0; // shared cdecl no-op (uCRT startup)
 constexpr uint32_t ST_MEMSET   = 0x1DF8;
-constexpr uint32_t ST_GCURPROC = 0x1E00; // GetCurrentProcess
+constexpr uint32_t ST_GCURPROC = 0xC70; // GetCurrentProcess (kernel32 slack; was
+// 0x1E00, which collides with MSVCRT_RVA: LoadLibraryA("msvcrt.dll") handed
+// back this stand-in's address as the fake msvcrt module handle)
 constexpr uint32_t ST_TERMPROC = 0x1E08; // TerminateProcess
 constexpr uint32_t ST_EH4      = 0x1E10; // _except_handler4_common
 constexpr uint32_t ST_THROW    = 0x1E20; // _CxxThrowException
@@ -57,6 +61,13 @@ constexpr uint32_t ST_CXXFRAME3 = 0x1E38; // __CxxFrameHandler3
 constexpr uint32_t ST_EH3       = 0x1E40; // _except_handler3
 constexpr uint32_t ST_ARGS      = 0x1E48; // _getmainargs / __getmainargs
 constexpr uint32_t ST_WARGS     = 0x1E50; // _wgetmainargs / __wgetmainargs
+constexpr uint32_t ST_W4SO       = 0x1E58; // WaitForSingleObject
+constexpr uint32_t ST_EXITTHREAD = 0x1E60; // ExitThread
+constexpr uint32_t ST_GCTHREAD   = 0x1E68; // GetCurrentThread
+constexpr uint32_t ST_SLEEP      = 0x1E70; // Sleep
+constexpr uint32_t ST_ATEXIT     = 0x1E78; // atexit
+constexpr uint32_t ST_ONEXIT     = 0x1E80; // _onexit
+constexpr uint32_t ST_DLLONEXIT  = 0x1E88; // __dllonexit
 // kernel32 slack (no export data below 0x1000): CRT-startup API stand-ins
 constexpr uint32_t ST_GSFT   = 0xC00; // GetSystemTimeAsFileTime
 constexpr uint32_t ST_QPC    = 0xC10; // QueryPerformanceCounter

@@ -95,7 +95,7 @@ struct Loaded {
     GuestRegion stk;
     GuestRegion env;
     GuestRegion heap;
-    ModuleRange realMods[24];
+    ModuleRange realMods[32];
     uint32_t realModCount = 0;
     uint64_t fsBase;
     uint64_t gsBase;
@@ -111,15 +111,19 @@ struct Loaded {
     // stand-in asks the dispatch loop to continue execution here instead of
     // returning (apiInitterm trampoline); cleared once consumed
     uint64_t tailJump = 0;
-    // TEMP batch G debugging: ring of the last executed in-image ips
-    uint64_t* ipRing = nullptr;
-    uint32_t ipRingIdx = 0;
     // iteration 6: guest exception machinery state
     EhCallFrame ehLog[kEhLogMax];
     uint32_t ehLogCount = 0;
     EhThrow ehThrow;
     EhPending eh;
     bool     is64;
+    // x64 host: ntdll Nt* syscall table, per-run (rebuilt by initNativeBridge);
+    // was process-global gSys/gSysCount
+    uint32_t sysNum[2048] = {};
+    void*    sysFn[2048] = {};
+    uint32_t sysCount = 0;
+    // rand/srand LCG seed, per-run (was file-static gRandSeed)
+    uint64_t randSeed = 0;
 };
 
 // Returns fault_code(Fault::BadFile) when the file cannot be read or is empty.

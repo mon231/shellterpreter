@@ -19,10 +19,28 @@ struct Fetch {
     const uint8_t* data; size_t len; size_t pos;
     // guest ip of data[0]: next-ip and rip-relative EAs are pos-relative
     uint64_t ipBase = 0;
-    uint8_t u8() { return data[pos++]; }
-    uint16_t u16() { uint16_t v; memcpy(&v, data + pos, 2); pos += 2; return v; }
-    uint32_t u32() { uint32_t v; memcpy(&v, data + pos, 4); pos += 4; return v; }
-    uint64_t u64() { uint64_t v; memcpy(&v, data + pos, 8); pos += 8; return v; }
+    // a fetch running past len (truncated blob): no host read past the image,
+    // the fault surfaces through the runLoop fetch-fault path (fail closed)
+    uint32_t fault = fault_code(Fault::None);
+    uint8_t u8() {
+        if (pos >= len) { fault = fault_code(Fault::OutsideMemory); return 0; }
+        return data[pos++];
+    }
+    uint16_t u16() {
+        uint16_t v = 0;
+        if (pos >= len || len - pos < 2) { fault = fault_code(Fault::OutsideMemory); pos = len; return 0; }
+        memcpy(&v, data + pos, 2); pos += 2; return v;
+    }
+    uint32_t u32() {
+        uint32_t v = 0;
+        if (pos >= len || len - pos < 4) { fault = fault_code(Fault::OutsideMemory); pos = len; return 0; }
+        memcpy(&v, data + pos, 4); pos += 4; return v;
+    }
+    uint64_t u64() {
+        uint64_t v = 0;
+        if (pos >= len || len - pos < 8) { fault = fault_code(Fault::OutsideMemory); pos = len; return 0; }
+        memcpy(&v, data + pos, 8); pos += 8; return v;
+    }
 };
 
 // modrm/sib/displacement fields of one operand
@@ -44,6 +62,7 @@ unsigned popcnt8(uint8_t value);
 template <Architecture architecture>
 uint32_t decodeMR(Fetch& f, MR& m) {
     const uint8_t byte = f.u8();
+    if (f.fault != fault_code(Fault::None)) return f.fault; // truncated blob: abort before the guessed EA executes
     m.mod = byte >> 6;
     m.reg = (byte >> 3) & 7;
     m.rm = byte & 7;
@@ -55,25 +74,30 @@ uint32_t decodeMR(Fetch& f, MR& m) {
     if (m.rm == 4) {
         m.hasSib = true;
         const uint8_t sib = f.u8();
+        if (f.fault != fault_code(Fault::None)) return f.fault;
         m.sibScale = sib >> 6;
         m.sibIndex = (sib >> 3) & 7;
         m.sibBase = sib & 7;
         if (m.sibBase == 5 && m.mod == 0) {
             if constexpr (architecture == Architecture::X64) m.disp = static_cast<int32_t>(f.u32());
             else m.disp = static_cast<int64_t>(f.u32());
+            if (f.fault != fault_code(Fault::None)) return f.fault;
             return fault_code(Fault::None);
         }
         if (m.mod == 1) m.disp = static_cast<int8_t>(f.u8());
         else if (m.mod == 2) m.disp = static_cast<int32_t>(f.u32());
+        if (f.fault != fault_code(Fault::None)) return f.fault;
         return fault_code(Fault::None);
     }
     if (m.rm == 5 && m.mod == 0) {
         if constexpr (architecture == Architecture::X64) { m.ripRel = true; m.disp = static_cast<int32_t>(f.u32()); }
         else { m.absDisp = true; m.disp = static_cast<int64_t>(f.u32()); }
+        if (f.fault != fault_code(Fault::None)) return f.fault;
         return fault_code(Fault::None);
     }
     if (m.mod == 1) m.disp = static_cast<int8_t>(f.u8());
     else if (m.mod == 2) m.disp = static_cast<int32_t>(f.u32());
+    if (f.fault != fault_code(Fault::None)) return f.fault;
     return fault_code(Fault::None);
 }
 
