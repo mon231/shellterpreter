@@ -110,7 +110,7 @@ returns normally it is the low 32 bits of `RAX`/`EAX`; the range
 | `0xE0000003` | bad shellcode file |
 | `0xE0000004` | memory allocation failed |
 | `0xE0000005` | runtime self-audit violation |
-| `0xE0000006` | `hlt` executed (also ends a stub chain; exit is then EAX) |
+| `0xE0000006` | `hlt` executed (also ends a stub chain; exit is then EAX); `exit`/`_exit`/`_amsg_exit`/`ExitThread` ride the same halt |
 | `0xE0000007` | architecture mismatch (32-bit build + x64 shellcode, wrong `--x86`/`--x64` flag) |
 | `0xE0000008` | bad command line |
 | `0xE0000009` | instruction budget exhausted |

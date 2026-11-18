@@ -108,6 +108,8 @@ struct Loaded {
     ThreadContext threads[8];
     uint32_t threadCount;
     uint32_t fault; // stand-in sets this to fail closed
+    bool processHalt = false; // apiExit halt: ends the whole run, not just the thread
+    uint32_t processExitCode = 0; // process-scoped halt's exit code (thread halts use ThreadContext::exitCode)
     // stand-in asks the dispatch loop to continue execution here instead of
     // returning (apiInitterm trampoline); cleared once consumed
     uint64_t tailJump = 0;

@@ -19,6 +19,8 @@ namespace stub {
 //   0x1D50 _beginthreadex stand-in        0x1D60 _Thrd_join stand-in
 //   0x1E58 WaitForSingleObject stand-in   0x1E60 ExitThread stand-in
 //   0x1E68 GetCurrentThread stand-in      0x1E70 Sleep stand-in
+//   0x1E78 atexit stand-in                0x1E80 _onexit stand-in
+//   0x1E88 __dllonexit stand-in
 //   0x1D70 _Thrd_id stand-in              0x1D80 _Cnd_do_broadcast_at_thread_exit
 //   0x1D90 malloc stand-in                0x1DA0 free stand-in
 //   0x1DB0 _callnewh stand-in             0x1DC0 fail-closed CRT helper

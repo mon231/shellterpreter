@@ -3372,6 +3372,9 @@ public:
 
         const uint32_t r = runLoop(e);
         if (r != fault_code(Fault::None) && r != fault_code(Fault::Halt)) return r;
+        // a process-scoped halt (exit/_exit/_amsg_exit) keeps its own code even
+        // when a guest thread raised it; thread-scoped halts never set this
+        if (l.processHalt) return l.processExitCode;
         return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
     }
 
@@ -3395,6 +3398,9 @@ public:
         // (ExitThread stand-in rides the halt; the join/wait stand-in
         // records this as the thread's exitCode)
         if (r != fault_code(Fault::None) && r != fault_code(Fault::Halt)) return r;
+        // ExitThread/hlt halt only this thread: clearing keeps the outer runLoop
+        // going. exit() sets processHalt, so its halt ends the whole run.
+        if (r == fault_code(Fault::Halt) && !l.processHalt) l.fault = fault_code(Fault::None);
         return static_cast<uint32_t>(e.r[0] & 0xFFFFFFFFull);
     }
 };

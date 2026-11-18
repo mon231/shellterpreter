@@ -84,7 +84,8 @@ static uint64_t apiGetProcAddress(Loaded& l, const uint64_t* args) {
         return 0;
     }
     char name[64];
-    if (!guestStr(l, args[1], name)) return 0;    if (nameEq(name, "LoadLibraryA"))  return l.env.base() + ST_LL_A;
+    if (!guestStr(l, args[1], name)) return 0;
+    if (nameEq(name, "LoadLibraryA"))  return l.env.base() + ST_LL_A;
     if (nameEq(name, "GetProcAddress")) return l.env.base() + ST_GP_A;
     if (nameEq(name, "MessageBoxA"))   return l.env.base() + ST_MB_A;
     if (nameEq(name, "printf"))        return l.env.base() + ST_PRINTF_A;
@@ -287,6 +288,8 @@ static uint64_t apiGetCurrentProcess(Loaded&, const uint64_t*) { return 0xFFFFFF
 // call guest callbacks natively (guest pages are not executable); stop the
 // run instead and surface the status as the process exit code
 static uint64_t apiExit(Loaded& l, const uint64_t* args) {
+    l.processHalt = true;
+    l.processExitCode = static_cast<uint32_t>(args[0]);
     l.fault = fault_code(Fault::Halt);
     return args[0];
 }
@@ -330,6 +333,7 @@ static uint64_t apiPrintf(Loaded& l, const uint64_t* args) {
         }
         // arguments at our call sites are 32-bit values; all guest pointers
         // fit below 4 GB (GuestRegion keeps every guest block under 0x80000000)
+        if (argIdx >= 8) return static_cast<uint64_t>(-1); // more conversions than declared args
         const uint64_t v = args[argIdx++] & 0xFFFFFFFFull;
         if (spec == 's') {
             char s[64];
@@ -776,7 +780,7 @@ static uint64_t apiBeginThread(Loaded& l, const uint64_t* args) {
     ThreadContext& t = l.threads[l.threadCount];
     t = ThreadContext{};
     if (!t.stack.allocate(stackSize, true)) return 0;
-    t.handle = 0x400ull + l.threadCount;
+    t.handle = 0x7E000001ull + (static_cast<uint64_t>(l.threadCount) << 2); // odd and positive: never a real handle, no sign bit
     t.entry = args[2];
     t.arg = args[3];
     t.done = false;

@@ -64,7 +64,8 @@ static void printFault(uint32_t code) {
 }
 
 int main(int argc, char** argv) {
-    std::string path;    int arch = 0;
+    std::string path;
+    int arch = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--x86") arch = 32;

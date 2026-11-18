@@ -56,7 +56,7 @@ closed.
 | `0xE0000003` | bad shellcode file |
 | `0xE0000004` | memory allocation failed |
 | `0xE0000005` | runtime self-audit violation |
-| `0xE0000006` | `hlt` executed (also ends a stub chain; exit is then EAX) |
+| `0xE0000006` | `hlt` executed (also ends a stub chain; exit is then EAX); `exit`/`_exit`/`_amsg_exit`/`ExitThread` ride the same halt |
 | `0xE0000007` | architecture mismatch (32-bit build + x64 shellcode, wrong `--x86`/`--x64` flag) |
 | `0xE0000008` | bad command line |
 | `0xE0000009` | instruction budget exhausted |
@@ -125,11 +125,9 @@ Batches A-H (`.sdd/ledger.md` batch headers, summary):
   modeled across a bridge.
 - **More user-mode instruction families** as real-world corpora demand them
   (fuzzing continues to surface gaps; everything else already fails closed).
-- Tracked product issues (ledger Batch H): whoami teardown fault variance
-  (0xC0000374/0xE000000A — native-heap delete mystery); native operator
-  new/delete[] asymmetry (silent leak, fails closed); no dedicated test for
-  the native-forward WAIT_FAILED path; rep cmps missing the rcx==0 early
-  guard.
+- Tracked product issues (ledger Batch H): native operator new/delete[]
+  asymmetry (silent leak, fails closed); no dedicated test for the
+  native-forward WAIT_FAILED path; rep cmps missing the rcx==0 early guard.
 
 ## Part 3 — Keynotes
 
